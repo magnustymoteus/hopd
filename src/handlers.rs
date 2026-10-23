@@ -6,6 +6,10 @@ use smithay_client_toolkit::{
     delegate_registry,
     dispatch2::Dispatch2,
     output::{OutputHandler, OutputState},
+    reexports::protocols_wlr::virtual_pointer::v1::client::{
+        zwlr_virtual_pointer_manager_v1::{self, ZwlrVirtualPointerManagerV1},
+        zwlr_virtual_pointer_v1::{self, ZwlrVirtualPointerV1},
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -61,6 +65,35 @@ impl Dispatch2<HyprlandGlobalShortcutV1, State> for Action {
         if let hyprland_global_shortcut_v1::Event::Pressed { .. } = event {
             state.shortcut_pressed(*self, qh);
         }
+    }
+}
+
+// --- Virtual pointer ---
+
+/// User data for the virtual-pointer manager and pointer; neither has events.
+pub struct VirtualPointerData;
+
+impl Dispatch2<ZwlrVirtualPointerManagerV1, State> for VirtualPointerData {
+    fn event(
+        &self,
+        _: &mut State,
+        _: &ZwlrVirtualPointerManagerV1,
+        _: zwlr_virtual_pointer_manager_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+    }
+}
+
+impl Dispatch2<ZwlrVirtualPointerV1, State> for VirtualPointerData {
+    fn event(
+        &self,
+        _: &mut State,
+        _: &ZwlrVirtualPointerV1,
+        _: zwlr_virtual_pointer_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
     }
 }
 
