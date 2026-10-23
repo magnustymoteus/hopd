@@ -8,7 +8,6 @@ use smithay_client_toolkit::{
         WaylandSurface,
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
     },
-    shm::slot::Buffer,
 };
 use wayland_client::{
     QueueHandle,
@@ -18,14 +17,15 @@ use wayland_client::{
 use crate::State;
 use crate::hints::{Hints, Typed};
 use crate::hyprland::{self, Monitor};
+use crate::overlay::Overlay;
 use crate::render::Area;
 
 /// The layer-shell namespace, which Hyprland layer rules can match on.
-const LAYER_NAMESPACE: &str = "hyprhopd";
+pub const LAYER_NAMESPACE: &str = "hyprhopd";
 
 pub struct PaneMode {
-    /// The overlay covering the window's monitor. Dropping it removes it from the screen.
-    layer: LayerSurface,
+    /// The overlay covering the window's monitor.
+    overlay: Overlay,
     hints: Hints,
     /// The target window's address, as events write it.
     window: String,
@@ -38,8 +38,6 @@ pub struct PaneMode {
     layout: (f64, f64, f64, f64),
     /// The overlay's size, known once Hyprland has configured it.
     size: Option<(u32, u32)>,
-    /// The buffer on screen, kept alive while Hyprland may still read it.
-    buffer: Option<Buffer>,
 }
 
 impl State {
@@ -47,6 +45,8 @@ impl State {
         if self.pane.is_some() || self.mode.is_some() {
             return;
         }
+        // The previous overlay may still be fading out; it goes away now.
+        self.fading_out = None;
         let window = match hyprland::active_window() {
             Ok(Some(window)) => window,
             Ok(None) => {
@@ -121,15 +121,20 @@ impl State {
         };
 
         println!("pane mode on ({} labels)", hints.visible().count());
-        self.pane = Some(PaneMode {
+        let overlay = Overlay::new(
             layer,
+            self.alpha_modifier.as_ref(),
+            self.config.animations.pane_in,
+            qh,
+        );
+        self.pane = Some(PaneMode {
+            overlay,
             hints,
             window: window.event_address().to_string(),
             area,
             window_at: (x, y),
             layout: layout_bounds(&monitors),
             size: None,
-            buffer: None,
         });
     }
 
@@ -167,14 +172,9 @@ impl State {
             &pane.hints,
             &self.config.pane,
         );
-        let surface = pane.layer.wl_surface();
-        if let Err(err) = buffer.attach_to(surface) {
+        if let Err(err) = pane.overlay.show(buffer, (width, height), &self.qh) {
             eprintln!("hyprhopd: cannot show the overlay: {err}");
-            return;
         }
-        surface.damage_buffer(0, 0, width as i32, height as i32);
-        pane.layer.commit();
-        pane.buffer = Some(buffer);
     }
 
     pub fn pane_key(&mut self, keysym: Keysym, text: Option<&str>) {
@@ -209,7 +209,8 @@ impl State {
         let (left, top, width, height) = pane.layout;
         let target_x = pane.window_at.0 + x - left;
         let target_y = pane.window_at.1 + y - top;
-        drop(pane);
+        // The labels fade out while the pointer is already where it's going.
+        self.retire(pane.overlay);
         self.virtual_pointer.motion_absolute(
             self.timestamp(),
             target_x.round() as u32,
@@ -223,15 +224,55 @@ impl State {
     }
 
     pub fn cancel_pane(&mut self) {
-        if self.pane.take().is_some() {
+        if let Some(pane) = self.pane.take() {
+            self.retire(pane.overlay);
             println!("pane mode off");
+        }
+    }
+
+    /// Fades an overlay out if pane_out asks for it, otherwise removes it at once.
+    fn retire(&mut self, mut overlay: Overlay) {
+        if overlay.fade_out(self.config.animations.pane_out, &self.qh) {
+            self.fading_out = Some(overlay);
         }
     }
 
     pub fn owns_pane_surface(&self, surface: &WlSurface) -> bool {
         self.pane
             .as_ref()
-            .is_some_and(|pane| pane.layer.wl_surface() == surface)
+            .is_some_and(|pane| pane.overlay.surface() == surface)
+    }
+
+    /// A frame callback for one of hyprhopd's overlays: time for the next fade step.
+    pub fn overlay_frame(&mut self, surface: &WlSurface) {
+        if let Some(pane) = self.pane.as_mut()
+            && pane.overlay.surface() == surface
+        {
+            pane.overlay.frame(&self.qh);
+        } else if let Some(overlay) = self.fading_out.as_mut()
+            && overlay.surface() == surface
+            && !overlay.frame(&self.qh)
+        {
+            self.fading_out = None;
+        }
+    }
+
+    /// Hyprland removed an overlay, for example because its monitor went away.
+    pub fn overlay_closed(&mut self, layer: &LayerSurface) {
+        if self
+            .pane
+            .as_ref()
+            .is_some_and(|pane| &pane.overlay.layer == layer)
+        {
+            self.pane = None;
+            println!("pane mode off");
+        } else if self
+            .fading_out
+            .as_ref()
+            .is_some_and(|overlay| &overlay.layer == layer)
+        {
+            self.fading_out = None;
+        }
     }
 
     /// Cancels pane mode when its window closes, moves or changes shape, since the

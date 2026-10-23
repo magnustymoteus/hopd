@@ -7,9 +7,15 @@ use smithay_client_toolkit::{
     delegate_registry,
     dispatch2::Dispatch2,
     output::{OutputHandler, OutputState},
-    reexports::protocols_wlr::virtual_pointer::v1::client::{
-        zwlr_virtual_pointer_manager_v1::{self, ZwlrVirtualPointerManagerV1},
-        zwlr_virtual_pointer_v1::{self, ZwlrVirtualPointerV1},
+    reexports::{
+        protocols::wp::alpha_modifier::v1::client::{
+            wp_alpha_modifier_surface_v1::{self, WpAlphaModifierSurfaceV1},
+            wp_alpha_modifier_v1::{self, WpAlphaModifierV1},
+        },
+        protocols_wlr::virtual_pointer::v1::client::{
+            zwlr_virtual_pointer_manager_v1::{self, ZwlrVirtualPointerManagerV1},
+            zwlr_virtual_pointer_v1::{self, ZwlrVirtualPointerV1},
+        },
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -94,12 +100,41 @@ impl Dispatch2<ZwlrVirtualPointerV1, State> for VirtualPointerData {
     }
 }
 
+// --- Alpha modifier, for fading overlays ---
+
+/// User data for the alpha-modifier manager and its per-surface objects; neither has
+/// events.
+pub struct AlphaModifierData;
+
+impl Dispatch2<WpAlphaModifierV1, State> for AlphaModifierData {
+    fn event(
+        &self,
+        _: &mut State,
+        _: &WpAlphaModifierV1,
+        _: wp_alpha_modifier_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+    }
+}
+
+impl Dispatch2<WpAlphaModifierSurfaceV1, State> for AlphaModifierData {
+    fn event(
+        &self,
+        _: &mut State,
+        _: &WpAlphaModifierSurfaceV1,
+        _: wp_alpha_modifier_surface_v1::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+    }
+}
+
 // --- Pane mode's overlay ---
 
 impl LayerShellHandler for State {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        // Hyprland removed the overlay, for example because its monitor went away.
-        self.cancel_pane();
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        self.overlay_closed(layer);
     }
 
     fn configure(
@@ -225,8 +260,7 @@ impl SeatHandler for State {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
-// The overlay is redrawn only when something changes, so frame callbacks and scale
-// changes aren't used yet.
+// Frame callbacks drive fades; scale changes aren't handled yet.
 impl CompositorHandler for State {
     fn scale_factor_changed(
         &mut self,
@@ -246,7 +280,15 @@ impl CompositorHandler for State {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        self.overlay_frame(surface);
+    }
 
     fn surface_enter(
         &mut self,

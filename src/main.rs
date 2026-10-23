@@ -1,8 +1,10 @@
 mod config;
+mod easing;
 mod handlers;
 mod hints;
 mod hyprland;
 mod motion;
+mod overlay;
 mod pane;
 mod protocol;
 mod render;
@@ -26,6 +28,7 @@ use smithay_client_toolkit::{
             timer::{TimeoutAction, Timer},
         },
         calloop_wayland_source::WaylandSource,
+        protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_v1::WpAlphaModifierV1,
         protocols_wlr::virtual_pointer::v1::client::{
             zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
             zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
@@ -46,8 +49,9 @@ use wayland_client::{
 };
 
 use config::{Config, Loaded};
-use handlers::{ManagerData, VirtualPointerData};
+use handlers::{AlphaModifierData, ManagerData, VirtualPointerData};
 use motion::{Direction, HeldKeys, ScrollDirection, ScrollKeys, Speed};
+use overlay::Overlay;
 use pane::PaneMode;
 use protocol::global_shortcuts::hyprland_global_shortcut_v1::HyprlandGlobalShortcutV1;
 use protocol::global_shortcuts::hyprland_global_shortcuts_manager_v1::HyprlandGlobalShortcutsManagerV1;
@@ -183,6 +187,10 @@ pub struct State {
     pool: SlotPool,
     keyboard: Option<WlKeyboard>,
     renderer: Renderer,
+    /// For creating Wayland objects outside event handlers, like frame callbacks.
+    qh: QueueHandle<State>,
+    /// Absent if Hyprland lacks wp_alpha_modifier_v1; fades are skipped then.
+    alpha_modifier: Option<WpAlphaModifierV1>,
     virtual_pointer: ZwlrVirtualPointerV1,
     loop_handle: LoopHandle<'static, State>,
     /// Reference point for the millisecond timestamps virtual-pointer events carry.
@@ -202,6 +210,8 @@ pub struct State {
     config_watch: Option<Inotify>,
     mode: Option<ActiveMode>,
     pane: Option<PaneMode>,
+    /// The last pane overlay, while it fades out after pane mode ended.
+    fading_out: Option<Overlay>,
 }
 
 fn main() -> ExitCode {
@@ -231,6 +241,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|_| "compositor does not support zwlr_layer_shell_v1")?;
     let shm = Shm::bind(&globals, &qh).map_err(|_| "compositor does not support wl_shm")?;
+    let alpha_modifier: Option<WpAlphaModifierV1> =
+        globals.bind(&qh, 1..=1, AlphaModifierData).ok();
     // Grows on demand; pane mode's first buffer sets the real size.
     let pool = SlotPool::new(4, &shm)?;
     // No seat given: Hyprland attaches it to the default seat.
@@ -263,6 +275,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         keyboard: None,
         renderer: Renderer::new(),
+        qh: qh.clone(),
+        alpha_modifier,
         virtual_pointer,
         loop_handle: event_loop.handle(),
         started: Instant::now(),
@@ -275,6 +289,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_watch: None,
         mode: None,
         pane: None,
+        fading_out: None,
     };
 
     // Flush the registrations and surface any protocol error right away.
@@ -288,6 +303,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     state.reload_config();
+    state.disable_layer_animation();
 
     match state.watch_config() {
         Ok(watch) => {
@@ -342,7 +358,16 @@ impl State {
                         "pane:font:family = {family}: no such font installed, using a fallback"
                     ));
                 }
-                self.config = config;
+                let animations = &config.animations;
+                let fades = !animations.pane_in.duration.is_zero()
+                    || !animations.pane_out.duration.is_zero();
+                if fades && self.alpha_modifier.is_none() {
+                    warnings.push(
+                        "animations: Hyprland lacks wp_alpha_modifier_v1, so fades are skipped"
+                            .to_string(),
+                    );
+                }
+                self.config = *config;
             }
             Some(Loaded::Missing) => {
                 println!("hyprhopd: no config file, using the defaults");
@@ -359,6 +384,16 @@ impl State {
         }
         warnings.extend(self.install_submap());
         self.report(&warnings);
+    }
+
+    /// Turns off Hyprland's own open and close animation for hyprhopd's overlay, so the
+    /// only fade is the one in hyprhopd.conf. Like the submap, it's added at runtime and
+    /// again after each Hyprland reload.
+    fn disable_layer_animation(&self) {
+        let lua = hyprland::no_anim_layer_rule_lua("hyprhopd-no-anim", pane::LAYER_NAMESPACE);
+        if let Err(err) = hyprland::eval(&lua) {
+            eprintln!("hyprhopd: cannot turn off Hyprland's overlay animation: {err}");
+        }
     }
 
     fn report(&self, warnings: &[String]) {
@@ -516,6 +551,7 @@ impl State {
             "configreloaded" => {
                 let warnings = self.install_submap();
                 self.report(&warnings);
+                self.disable_layer_animation();
             }
             // The submap changed without hyprhopd (another reset, a reload): leave the mode
             // so no button stays pressed and no timer keeps running.

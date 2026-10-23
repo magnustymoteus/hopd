@@ -13,13 +13,23 @@
 //!         padding = 1 4
 //!     }
 //! }
+//! animations {
+//!     bezier = quick, 0.15, 0, 0.1, 1
+//!     pane_in {
+//!         duration = 150
+//!         curve = quick
+//!     }
+//! }
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hyprlang::{ConfigOptions, ConfigValue, ParseResult};
 
+use crate::easing::Curve;
 use crate::motion::{Direction, ScrollDirection, Speed};
 use crate::{Action, MouseButton};
 
@@ -69,6 +79,17 @@ const PANE_OPTIONS: [&str; 13] = [
     "pane:label:border:color",
     "pane:backdrop:color",
 ];
+
+const ANIMATION_OPTIONS: [&str; 4] = [
+    "animations:pane_in:duration",
+    "animations:pane_in:curve",
+    "animations:pane_out:duration",
+    "animations:pane_out:curve",
+];
+
+/// Curves every config can use without defining them.
+const BUILT_IN_CURVES: [(&str, Curve); 2] =
+    [("linear", Curve::LINEAR), ("ease_out", Curve::EASE_OUT)];
 
 /// Smallest allowed `pane:spacing`, in pixels.
 const MIN_SPACING: f64 = 10.0;
@@ -205,10 +226,35 @@ impl Default for PaneConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Animation {
+    /// Zero means no animation: the change is instant.
+    pub duration: Duration,
+    pub curve: Curve,
+}
+
+impl Default for Animation {
+    fn default() -> Animation {
+        Animation {
+            duration: Duration::ZERO,
+            curve: Curve::EASE_OUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Animations {
+    /// Pane mode's labels fading in.
+    pub pane_in: Animation,
+    /// Pane mode's labels fading out.
+    pub pane_out: Animation,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub normal: NormalConfig,
     pub pane: PaneConfig,
+    pub animations: Animations,
 }
 
 impl Default for Config {
@@ -223,6 +269,7 @@ impl Default for Config {
                 scroll_speed: DEFAULT_SCROLL_SPEED,
             },
             pane: PaneConfig::default(),
+            animations: Animations::default(),
         }
     }
 }
@@ -238,7 +285,8 @@ pub fn default_binds(action: Action) -> impl Iterator<Item = Bind> {
 /// The outcome of reading the config file.
 pub enum Loaded {
     /// Parsed, with a warning for each setting that was skipped.
-    Parsed(Config, Vec<String>),
+    /// Boxed: a Config is large, and the other variants are tiny.
+    Parsed(Box<Config>, Vec<String>),
     /// No config file; the defaults apply.
     Missing,
     /// The file couldn't be parsed at all (a syntax error, or unreadable).
@@ -275,6 +323,7 @@ fn parse_with(run: impl FnOnce(&mut hyprlang::Config) -> ParseResult<()>) -> Loa
     });
     // Registering `bind` as a handler keeps every bind line instead of only the last.
     parser.register_category_handler_fn("normal", "bind", |_| Ok(()));
+    parser.register_category_handler_fn("animations", "bezier", |_| Ok(()));
     if let Err(err) = run(&mut parser) {
         return Loaded::Broken(err.to_string());
     }
@@ -307,6 +356,7 @@ fn parse_with(run: impl FnOnce(&mut hyprlang::Config) -> ParseResult<()>) -> Loa
     config.normal.scroll_speed =
         read_speed(&parser, "scroll_speed", DEFAULT_SCROLL_SPEED, &mut warnings);
     config.pane = read_pane(&parser, &mut warnings);
+    config.animations = read_animations(&parser, &mut warnings);
 
     let mut unknown: Vec<&str> = parser
         .keys()
@@ -318,7 +368,7 @@ fn parse_with(run: impl FnOnce(&mut hyprlang::Config) -> ParseResult<()>) -> Loa
         warnings.push(format!("unknown option {key}"));
     }
 
-    Loaded::Parsed(config, warnings)
+    Loaded::Parsed(Box::new(config), warnings)
 }
 
 /// Parses `MODS, key, action`, as in `SHIFT CTRL, h, left`.
@@ -473,6 +523,74 @@ fn parse_padding(value: &str) -> Option<(f32, f32)> {
     }
 }
 
+fn read_animations(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> Animations {
+    let mut curves: HashMap<String, Curve> = BUILT_IN_CURVES
+        .iter()
+        .map(|&(name, curve)| (name.to_string(), curve))
+        .collect();
+    for line in parser
+        .get_handler_calls("animations:bezier")
+        .into_iter()
+        .flatten()
+    {
+        match parse_bezier(line) {
+            Ok((name, curve)) => {
+                curves.insert(name, curve);
+            }
+            Err(reason) => warnings.push(format!("animations: bezier = {line}: {reason}")),
+        }
+    }
+
+    let mut animations = Animations::default();
+    for (name, animation) in [
+        ("pane_in", &mut animations.pane_in),
+        ("pane_out", &mut animations.pane_out),
+    ] {
+        let key = format!("animations:{name}:duration");
+        if let Some(ms) = number(parser, &key, warnings) {
+            if ms >= 0.0 {
+                animation.duration = Duration::from_secs_f64(ms / 1000.0);
+            } else {
+                warnings.push(format!("{key} = {ms}: can't be negative"));
+            }
+        }
+        let key = format!("animations:{name}:curve");
+        if let Some(curve) = text(parser, &key, warnings) {
+            match curves.get(&curve) {
+                Some(&found) => animation.curve = found,
+                None => warnings.push(format!(
+                    "{key} = {curve}: no such curve, using ease_out (define it with bezier = {curve}, x1, y1, x2, y2)"
+                )),
+            }
+        }
+    }
+    animations
+}
+
+/// `name, x1, y1, x2, y2`, as in Hyprland's `bezier`.
+fn parse_bezier(value: &str) -> Result<(String, Curve), String> {
+    let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+    let [name, numbers @ ..] = &parts[..] else {
+        return Err("expected name, x1, y1, x2, y2".to_string());
+    };
+    let numbers: Vec<f64> = numbers
+        .iter()
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()
+        .ok_or("expected name, x1, y1, x2, y2")?;
+    let [x1, y1, x2, y2] = numbers[..] else {
+        return Err("expected name, x1, y1, x2, y2".to_string());
+    };
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    // Outside this range, x would not keep rising, so time could run backwards.
+    if !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
+        return Err("x1 and x2 must be between 0 and 1".to_string());
+    }
+    Ok((name.to_string(), Curve::new(x1, y1, x2, y2)))
+}
+
 /// A number option, or `None` (with a warning if it's set to something else).
 fn number(parser: &hyprlang::Config, key: &str, warnings: &mut Vec<String>) -> Option<f64> {
     match parser.get(key).ok()? {
@@ -560,7 +678,7 @@ fn parse_weight(value: &str) -> Option<u16> {
 }
 
 fn is_known_option(key: &str) -> bool {
-    if PANE_OPTIONS.contains(&key) {
+    if PANE_OPTIONS.contains(&key) || ANIMATION_OPTIONS.contains(&key) {
         return true;
     }
     let mut parts = key.split(':');
@@ -578,7 +696,7 @@ mod tests {
 
     fn parsed(text: &str) -> (Config, Vec<String>) {
         match parse(text) {
-            Loaded::Parsed(config, warnings) => (config, warnings),
+            Loaded::Parsed(config, warnings) => (*config, warnings),
             Loaded::Missing => panic!("parse never reports a missing file"),
             Loaded::Broken(err) => panic!("unexpected syntax error: {err}"),
         }
@@ -768,6 +886,43 @@ mod tests {
         for action in Action::ALL.into_iter().filter(|a| a.in_normal_mode()) {
             assert!(default_binds(action).next().is_some(), "{action:?}");
         }
+    }
+
+    #[test]
+    fn animations_use_built_in_and_defined_curves() {
+        let (config, warnings) = parsed(
+            "animations {\n  bezier = quick, 0.15, 0, 0.1, 1\n  pane_in {\n    duration = 150\n    curve = quick\n  }\n  pane_out {\n    duration = 80.5\n    curve = linear\n  }\n}\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let animations = config.animations;
+        assert_eq!(animations.pane_in.duration, Duration::from_millis(150));
+        assert_eq!(animations.pane_in.curve, Curve::new(0.15, 0.0, 0.1, 1.0));
+        assert_eq!(animations.pane_out.duration, Duration::from_micros(80_500));
+        assert_eq!(animations.pane_out.curve, Curve::LINEAR);
+    }
+
+    #[test]
+    fn animations_default_to_instant() {
+        let (config, _) = parsed("");
+        assert_eq!(config.animations.pane_in.duration, Duration::ZERO);
+        assert_eq!(config.animations.pane_out.duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn bad_animations_are_skipped_with_a_warning() {
+        let (config, warnings) = parsed(
+            "animations {\n  bezier = back, 1.5, 0, 0.5, 1\n  bezier = short, 0, 0\n  pane_in {\n    duration = -1\n    curve = back\n  }\n}\n",
+        );
+        assert_eq!(
+            warnings,
+            [
+                "animations: bezier = back, 1.5, 0, 0.5, 1: x1 and x2 must be between 0 and 1",
+                "animations: bezier = short, 0, 0: expected name, x1, y1, x2, y2",
+                "animations:pane_in:duration = -1: can't be negative",
+                "animations:pane_in:curve = back: no such curve, using ease_out (define it with bezier = back, x1, y1, x2, y2)",
+            ]
+        );
+        assert_eq!(config.animations, Animations::default());
     }
 
     #[test]

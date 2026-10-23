@@ -207,6 +207,16 @@ pub fn exit_bind_lua(name: &str, key: &str, app_id: &str, shortcut: &str) -> Str
     )
 }
 
+/// Lua that adds layer rule `name`, turning off Hyprland's animations for layer surfaces
+/// with exactly this namespace. Adding a rule whose name exists again is harmless.
+pub fn no_anim_layer_rule_lua(name: &str, namespace: &str) -> String {
+    format!(
+        "hl.layer_rule({{ name = {}, match = {{ namespace = {} }}, no_anim = true }})",
+        lua_string(name),
+        lua_string(&format!("^{namespace}$"))
+    )
+}
+
 /// Lua that swallows every key submap `name` doesn't bind. Catch-all also fires for bound
 /// keys, so it must do nothing.
 pub fn catchall_lua(name: &str) -> String {
@@ -251,6 +261,14 @@ mod tests {
              \x20   hl.dispatch(hl.dsp.global(\"hyprhopd:exit\"))\n\
              \x20 end)\n\
              end)\n"
+        );
+    }
+
+    #[test]
+    fn layer_rule_matches_the_namespace_exactly() {
+        assert_eq!(
+            no_anim_layer_rule_lua("hyprhopd-no-anim", "hyprhopd"),
+            "hl.layer_rule({ name = \"hyprhopd-no-anim\", match = { namespace = \"^hyprhopd$\" }, no_anim = true })"
         );
     }
 
