@@ -66,11 +66,15 @@ fn log_path(state_home: Option<OsString>, home: Option<OsString>) -> Option<Path
     Some(state_home.join("hyprhopd").join("hyprhopd.log"))
 }
 
-/// Opens the log file empty, so each run starts a fresh log.
+/// Opens the log file empty, so each run starts a fresh log. The previous run's log is
+/// kept as hyprhopd.log.old, so a crash's message survives one restart.
 fn open(path: &Path) -> std::io::Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
+    // Fails on the first run, when there's no log yet; otherwise at worst the old log is
+    // overwritten, which is no reason to stop logging.
+    let _ = fs::rename(path, path.with_extension("log.old"));
     File::create(path)
 }
 
@@ -104,5 +108,24 @@ mod tests {
     #[test]
     fn no_path_without_any_directory() {
         assert_eq!(log_path(None, None), None);
+    }
+
+    #[test]
+    fn the_previous_log_is_kept_as_old() {
+        use std::io::Write;
+        let dir = env::temp_dir().join(format!("hyprhopd-log-test-{}", std::process::id()));
+        let path = dir.join("hyprhopd.log");
+        let old = dir.join("hyprhopd.log.old");
+
+        // The first run has nothing to keep.
+        writeln!(open(&path).unwrap(), "first run").unwrap();
+        assert!(!old.exists());
+
+        writeln!(open(&path).unwrap(), "second run").unwrap();
+        let third = open(&path).unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), "second run\n");
+        assert_eq!(third.metadata().unwrap().len(), 0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

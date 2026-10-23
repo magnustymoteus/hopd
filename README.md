@@ -21,7 +21,7 @@ Control the pointer from the keyboard on [Hyprland](https://hypr.land), in the s
 
 - Hyprland with a Lua config (`hyprland.lua`). hyprhopd installs its keys through
   Hyprland's Lua API. Tested on Hyprland 0.56.2.
-- Rust 1.88 or newer, to build it.
+- Rust 1.89 or newer, to build it.
 
 ## Install
 
