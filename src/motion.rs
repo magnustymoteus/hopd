@@ -68,9 +68,71 @@ impl HeldKeys {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Down,
+    Up,
+}
+
+/// Which scroll keys are currently held.
+#[derive(Debug, Default)]
+pub struct ScrollKeys([bool; 2]);
+
+impl ScrollKeys {
+    pub fn set(&mut self, direction: ScrollDirection, held: bool) {
+        self.0[direction as usize] = held;
+    }
+
+    pub fn any(&self) -> bool {
+        self.0.iter().any(|&held| held)
+    }
+
+    /// Vertical scroll amount for one tick: `speed` units per second for `elapsed` time.
+    /// Positive scrolls down, matching wl_pointer's vertical axis.
+    pub fn delta(&self, speed: f64, elapsed: Duration) -> f64 {
+        let [down, up] = self.0.map(f64::from);
+        (down - up) * speed * elapsed.as_secs_f64()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scrolling(directions: &[ScrollDirection]) -> ScrollKeys {
+        let mut keys = ScrollKeys::default();
+        for &direction in directions {
+            keys.set(direction, true);
+        }
+        keys
+    }
+
+    #[test]
+    fn scroll_down_is_positive_and_up_is_negative() {
+        let one_second = Duration::from_secs(1);
+        assert_eq!(
+            scrolling(&[ScrollDirection::Down]).delta(300.0, one_second),
+            300.0
+        );
+        assert_eq!(
+            scrolling(&[ScrollDirection::Up]).delta(300.0, one_second),
+            -300.0
+        );
+    }
+
+    #[test]
+    fn scroll_scales_with_elapsed_time() {
+        let keys = scrolling(&[ScrollDirection::Down]);
+        assert_eq!(keys.delta(300.0, Duration::from_millis(100)), 30.0);
+    }
+
+    #[test]
+    fn opposite_scroll_keys_cancel() {
+        let keys = scrolling(&[ScrollDirection::Down, ScrollDirection::Up]);
+        assert_eq!(keys.delta(300.0, Duration::from_secs(1)), 0.0);
+        assert!(keys.any());
+        assert!(!ScrollKeys::default().any());
+    }
 
     const SPEED: Speed = Speed {
         initial: 220.0,
