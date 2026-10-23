@@ -471,7 +471,7 @@ fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfi
         match parse_weight(&weight) {
             Some(weight) => pane.font.weight = weight,
             None => warnings.push(format!(
-                "pane:font:weight = {weight}: expected thin, light, normal, medium, bold, black, ... or 100 to 900"
+                "pane:font:weight = {weight}: expected thin, light, normal, medium, bold, black, ... or a number from 1 to 1000"
             )),
         }
     }
@@ -923,6 +923,17 @@ mod tests {
             ]
         );
         assert_eq!(config.animations, Animations::default());
+    }
+
+    #[test]
+    fn the_example_config_is_valid() {
+        let (config, warnings) = parsed(include_str!("../examples/hyprhopd.conf"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.normal.binds, Config::default().normal.binds);
+        assert_eq!(
+            config.animations.pane_in.duration,
+            Duration::from_millis(150)
+        );
     }
 
     #[test]
