@@ -2,6 +2,7 @@
 //! Most are empty: hyprhopd reacts to shortcuts, and in pane mode to its overlay's
 //! configure events and keys.
 
+use log::error;
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
     delegate_registry,
@@ -238,7 +239,7 @@ impl SeatHandler for State {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
-                Err(err) => eprintln!("hyprhopd: cannot use the keyboard: {err}"),
+                Err(err) => error!("cannot use the keyboard: {err}"),
             }
         }
     }

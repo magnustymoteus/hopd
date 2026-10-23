@@ -3,6 +3,7 @@ mod easing;
 mod handlers;
 mod hints;
 mod hyprland;
+mod logging;
 mod motion;
 mod overlay;
 mod pane;
@@ -17,6 +18,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use inotify::{Inotify, WatchMask};
+use log::{error, info, warn};
 
 use smithay_client_toolkit::{
     compositor::CompositorState,
@@ -215,10 +217,15 @@ pub struct State {
 }
 
 fn main() -> ExitCode {
+    let version = env!("CARGO_PKG_VERSION");
+    match logging::init() {
+        Some(path) => info!("hyprhopd {version}, logging to {}", path.display()),
+        None => info!("hyprhopd {version}"),
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("hyprhopd: {err}");
+            error!("{err}");
             ExitCode::FAILURE
         }
     }
@@ -297,9 +304,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // A previous hyprhopd may have crashed inside its submap; get the keyboard back.
     if hyprland::current_submap().is_ok_and(|name| name.starts_with(SUBMAP_PREFIX)) {
-        println!("hyprhopd: leaving a submap left behind by a previous run");
+        info!("leaving a submap left behind by a previous run");
         if let Err(err) = hyprland::reset_submap() {
-            eprintln!("hyprhopd: cannot reset the submap: {err}");
+            error!("cannot reset the submap: {err}");
         }
     }
     state.reload_config();
@@ -319,7 +326,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map_err(|e| format!("cannot add the config watch to the event loop: {e}"))?;
         }
-        Err(err) => eprintln!("hyprhopd: config changes won't apply until restart: {err}"),
+        Err(err) => warn!("config changes won't apply until restart: {err}"),
     }
 
     let events = hyprland::event_stream()
@@ -333,7 +340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("cannot add Hyprland events to the event loop: {e}"))?;
 
-    println!("hyprhopd: registered {APP_ID}:normal and {APP_ID}:pane, waiting for shortcuts");
+    info!("registered {APP_ID}:normal and {APP_ID}:pane, waiting for shortcuts");
 
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
@@ -370,7 +377,7 @@ impl State {
                 self.config = *config;
             }
             Some(Loaded::Missing) => {
-                println!("hyprhopd: no config file, using the defaults");
+                info!("no config file, using the defaults");
                 self.config = Config::default();
             }
             // Keep the current config, so a half-typed edit doesn't wipe the binds.
@@ -379,7 +386,7 @@ impl State {
                 return;
             }
             None => {
-                println!("hyprhopd: neither XDG_CONFIG_HOME nor HOME is set, using the defaults")
+                info!("neither XDG_CONFIG_HOME nor HOME is set, using the defaults")
             }
         }
         warnings.extend(self.install_submap());
@@ -392,7 +399,7 @@ impl State {
     fn disable_layer_animation(&self) {
         let lua = hyprland::no_anim_layer_rule_lua("hyprhopd-no-anim", pane::LAYER_NAMESPACE);
         if let Err(err) = hyprland::eval(&lua) {
-            eprintln!("hyprhopd: cannot turn off Hyprland's overlay animation: {err}");
+            warn!("cannot turn off Hyprland's overlay animation: {err}");
         }
     }
 
@@ -401,11 +408,11 @@ impl State {
             return;
         }
         for warning in warnings {
-            eprintln!("hyprhopd: {warning}");
+            warn!("{warning}");
         }
         let message = format!("hyprhopd.conf: {}", warnings.join("; "));
         if let Err(err) = hyprland::notify(&message, WARNING_DURATION_MS) {
-            eprintln!("hyprhopd: cannot show a notification: {err}");
+            warn!("cannot show a notification: {err}");
         }
     }
 
@@ -450,7 +457,7 @@ impl State {
             }
         }
         if !installed.contains(&Action::Exit) {
-            eprintln!("hyprhopd: normal mode is unavailable: no exit bind could be installed");
+            error!("normal mode is unavailable: no exit bind could be installed");
             self.submap = None;
             return warnings;
         }
@@ -458,7 +465,7 @@ impl State {
         if let Err(err) = hyprland::eval(&hyprland::catchall_lua(&name)) {
             warnings.push(format!("normal: other keys won't be blocked: {err}"));
         }
-        println!("hyprhopd: installed submap {name}");
+        info!("installed submap {name}");
         self.submap = Some(name);
         warnings
     }
@@ -504,13 +511,13 @@ impl State {
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    eprintln!("hyprhopd: cannot read config changes: {err}");
+                    error!("cannot read config changes: {err}");
                     return PostAction::Remove;
                 }
             }
         }
         if changed {
-            println!("hyprhopd: config changed, reloading");
+            info!("config changed, reloading");
             self.reload_config();
         }
         PostAction::Continue
@@ -522,7 +529,7 @@ impl State {
         loop {
             match (&*stream).read(&mut chunk) {
                 Ok(0) => {
-                    eprintln!("hyprhopd: Hyprland closed its event socket");
+                    error!("Hyprland closed its event socket");
                     return PostAction::Remove;
                 }
                 Ok(n) => self
@@ -531,7 +538,7 @@ impl State {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                 Err(err) => {
-                    eprintln!("hyprhopd: cannot read Hyprland events: {err}");
+                    error!("cannot read Hyprland events: {err}");
                     return PostAction::Remove;
                 }
             }
@@ -580,11 +587,11 @@ impl State {
             return;
         }
         let Some(submap) = self.submap.clone() else {
-            eprintln!("hyprhopd: normal mode is unavailable, its submap isn't installed");
+            error!("normal mode is unavailable, its submap isn't installed");
             return;
         };
         if let Err(err) = hyprland::enter_submap(&submap) {
-            eprintln!("hyprhopd: cannot enter submap {submap}: {err}");
+            error!("cannot enter submap {submap}: {err}");
             return;
         }
         self.mode = Some(ActiveMode {
@@ -599,7 +606,7 @@ impl State {
             last_tick: Instant::now(),
             timer: None,
         });
-        println!(
+        info!(
             "normal mode on (motion at {:.0} Hz)",
             1.0 / self.tick_interval().as_secs_f64()
         );
@@ -624,9 +631,9 @@ impl State {
         if hyprland::current_submap().is_ok_and(|name| name == mode.submap)
             && let Err(err) = hyprland::reset_submap()
         {
-            eprintln!("hyprhopd: cannot leave the submap: {err}");
+            error!("cannot leave the submap: {err}");
         }
-        println!("normal mode off");
+        info!("normal mode off");
     }
 
     fn set_moving(&mut self, direction: Direction, held: bool) {
@@ -702,7 +709,7 @@ impl State {
             .insert_source(timer, |_, _, state| state.motion_tick())
         {
             Ok(token) => mode.timer = Some(token),
-            Err(err) => eprintln!("hyprhopd: cannot start the motion timer: {err}"),
+            Err(err) => error!("cannot start the motion timer: {err}"),
         }
     }
 

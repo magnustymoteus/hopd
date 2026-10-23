@@ -1,6 +1,7 @@
 //! Pane mode: labels over the focused window. Typing one jumps the pointer there and
 //! hands over to normal mode, for clicking and fine-tuning.
 
+use log::{error, info, warn};
 use smithay_client_toolkit::{
     compositor::Region,
     seat::keyboard::Keysym,
@@ -50,23 +51,23 @@ impl State {
         let window = match hyprland::active_window() {
             Ok(Some(window)) => window,
             Ok(None) => {
-                println!("pane mode: no window is focused");
+                info!("pane mode: no window is focused");
                 return;
             }
             Err(err) => {
-                eprintln!("hyprhopd: cannot find the focused window: {err}");
+                warn!("cannot find the focused window: {err}");
                 return;
             }
         };
         let monitors = match hyprland::monitors() {
             Ok(monitors) => monitors,
             Err(err) => {
-                eprintln!("hyprhopd: cannot list monitors: {err}");
+                warn!("cannot list monitors: {err}");
                 return;
             }
         };
         let Some(monitor) = monitors.iter().find(|m| m.id == window.monitor) else {
-            eprintln!("hyprhopd: the focused window's monitor is missing");
+            warn!("the focused window's monitor is missing");
             return;
         };
         // Wayland names outputs the way Hyprland names monitors, like eDP-1.
@@ -76,7 +77,7 @@ impl State {
                 .and_then(|info| info.name)
                 .is_some_and(|name| name == monitor.name)
         }) else {
-            eprintln!("hyprhopd: no Wayland output for monitor {}", monitor.name);
+            warn!("no Wayland output for monitor {}", monitor.name);
             return;
         };
 
@@ -89,7 +90,7 @@ impl State {
         // An empty input region lets the pointer pass through to the window.
         match Region::new(&self.compositor) {
             Ok(region) => surface.set_input_region(Some(region.wl_region())),
-            Err(err) => eprintln!("hyprhopd: cannot make the overlay click-through: {err}"),
+            Err(err) => warn!("cannot make the overlay click-through: {err}"),
         }
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -109,7 +110,7 @@ impl State {
 
         // So the backdrop's corners match the window's. Without it they're square.
         let radius = hyprland::window_rounding().unwrap_or_else(|err| {
-            eprintln!("hyprhopd: cannot read Hyprland's window rounding: {err}");
+            warn!("cannot read Hyprland's window rounding: {err}");
             0
         });
         let area = Area {
@@ -120,7 +121,7 @@ impl State {
             radius: radius as f32,
         };
 
-        println!("pane mode on ({} labels)", hints.visible().count());
+        info!("pane mode on ({} labels)", hints.visible().count());
         let overlay = Overlay::new(
             layer,
             self.alpha_modifier.as_ref(),
@@ -160,7 +161,7 @@ impl State {
         ) {
             Ok(created) => created,
             Err(err) => {
-                eprintln!("hyprhopd: cannot allocate the overlay: {err}");
+                error!("cannot allocate the overlay: {err}");
                 return;
             }
         };
@@ -173,7 +174,7 @@ impl State {
             &self.config.pane,
         );
         if let Err(err) = pane.overlay.show(buffer, (width, height), &self.qh) {
-            eprintln!("hyprhopd: cannot show the overlay: {err}");
+            error!("cannot show the overlay: {err}");
         }
     }
 
@@ -219,14 +220,14 @@ impl State {
             height.round() as u32,
         );
         self.virtual_pointer.frame();
-        println!("pane mode off, jumped");
+        info!("pane mode off, jumped");
         self.enter_normal_mode();
     }
 
     pub fn cancel_pane(&mut self) {
         if let Some(pane) = self.pane.take() {
             self.retire(pane.overlay);
-            println!("pane mode off");
+            info!("pane mode off");
         }
     }
 
@@ -265,7 +266,7 @@ impl State {
             .is_some_and(|pane| &pane.overlay.layer == layer)
         {
             self.pane = None;
-            println!("pane mode off");
+            info!("pane mode off");
         } else if self
             .fading_out
             .as_ref()
@@ -289,7 +290,7 @@ impl State {
             _ => false,
         };
         if cancel {
-            println!("pane mode: the window changed");
+            info!("pane mode: the window changed");
             self.cancel_pane();
         }
     }
