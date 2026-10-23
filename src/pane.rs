@@ -18,6 +18,7 @@ use wayland_client::{
 use crate::State;
 use crate::hints::{Hints, Typed};
 use crate::hyprland::{self, Monitor};
+use crate::render::Area;
 
 /// The layer-shell namespace, which Hyprland layer rules can match on.
 const LAYER_NAMESPACE: &str = "hyprhopd";
@@ -28,8 +29,8 @@ pub struct PaneMode {
     hints: Hints,
     /// The target window's address, as events write it.
     window: String,
-    /// The window's top-left corner on the overlay.
-    origin: (f64, f64),
+    /// Where the window is on the overlay.
+    area: Area,
     /// The window's top-left corner in layout coordinates.
     window_at: (f64, f64),
     /// Top-left corner and size of the whole monitor layout, which absolute pointer
@@ -106,12 +107,25 @@ impl State {
         // The first commit carries no buffer; drawing waits for Hyprland's configure.
         layer.commit();
 
+        // So the backdrop's corners match the window's. Without it they're square.
+        let radius = hyprland::window_rounding().unwrap_or_else(|err| {
+            eprintln!("hyprhopd: cannot read Hyprland's window rounding: {err}");
+            0
+        });
+        let area = Area {
+            x: (x - f64::from(monitor.x)) as f32,
+            y: (y - f64::from(monitor.y)) as f32,
+            width: width as f32,
+            height: height as f32,
+            radius: radius as f32,
+        };
+
         println!("pane mode on ({} labels)", hints.visible().count());
         self.pane = Some(PaneMode {
             layer,
             hints,
             window: window.event_address().to_string(),
-            origin: (x - f64::from(monitor.x), y - f64::from(monitor.y)),
+            area,
             window_at: (x, y),
             layout: layout_bounds(&monitors),
             size: None,
@@ -149,7 +163,7 @@ impl State {
             canvas,
             width,
             height,
-            pane.origin,
+            pane.area,
             &pane.hints,
             &self.config.pane,
         );

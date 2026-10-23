@@ -122,6 +122,18 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
     serde_json::from_str(&reply).map_err(|err| format!("unexpected monitors reply: {err}"))
 }
 
+/// Hyprland's `decoration:rounding`: the radius of window corners, in pixels.
+pub fn window_rounding() -> Result<i64, String> {
+    #[derive(Deserialize)]
+    struct IntOption {
+        int: i64,
+    }
+    let reply = request("j/getoption decoration:rounding").map_err(|err| err.to_string())?;
+    serde_json::from_str::<IntOption>(&reply)
+        .map(|option| option.int)
+        .map_err(|err| format!("unexpected getoption reply: {err}"))
+}
+
 /// Connects to the event socket, which streams lines like `configreloaded>>`.
 pub fn event_stream() -> io::Result<UnixStream> {
     UnixStream::connect(socket_dir()?.join(".socket2.sock"))

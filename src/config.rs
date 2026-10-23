@@ -9,7 +9,9 @@
 //! }
 //! pane {
 //!     spacing = 60
-//!     background = rgba(1e1e2ecc)
+//!     label {
+//!         padding = 1 4
+//!     }
 //! }
 //! ```
 
@@ -52,15 +54,20 @@ const DEFAULT_SCROLL_SPEED: Speed = Speed {
 /// Options hyprhopd understands, besides `normal:bind`.
 const SPEED_OPTIONS: [&str; 2] = ["speed", "scroll_speed"];
 const SPEED_FIELDS: [&str; 3] = ["initial", "acceleration", "max"];
-const PANE_OPTIONS: [&str; 8] = [
+const PANE_OPTIONS: [&str; 13] = [
     "pane:spacing",
     "pane:chars",
     "pane:font:family",
     "pane:font:size",
     "pane:font:weight",
-    "pane:text_color",
-    "pane:typed_color",
-    "pane:background",
+    "pane:label:text_color",
+    "pane:label:typed_color",
+    "pane:label:background",
+    "pane:label:padding",
+    "pane:label:radius",
+    "pane:label:border:width",
+    "pane:label:border:color",
+    "pane:backdrop:color",
 ];
 
 /// Smallest allowed `pane:spacing`, in pixels.
@@ -145,6 +152,23 @@ pub struct Font {
     pub weight: u16,
 }
 
+/// How each label looks. Its box is laid out like CSS: text, then padding, then the
+/// border, with the background under all of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelStyle {
+    pub text_color: Rgba,
+    /// Colour of the letters already typed.
+    pub typed_color: Rgba,
+    pub background: Rgba,
+    /// Vertical and horizontal padding, in pixels.
+    pub padding: (f32, f32),
+    /// Corner radius in pixels; 0 gives square corners.
+    pub radius: f32,
+    /// Border width in pixels; 0 means no border.
+    pub border_width: f32,
+    pub border_color: Rgba,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaneConfig {
     /// Distance between neighbouring label centres, in pixels.
@@ -152,10 +176,9 @@ pub struct PaneConfig {
     /// Characters labels are made of, in the order labels use them.
     pub chars: Vec<char>,
     pub font: Font,
-    pub text_color: Rgba,
-    /// Colour of the letters already typed.
-    pub typed_color: Rgba,
-    pub background: Rgba,
+    pub label: LabelStyle,
+    /// Dims the target window behind the labels; transparent means off.
+    pub backdrop: Rgba,
 }
 
 impl Default for PaneConfig {
@@ -168,9 +191,16 @@ impl Default for PaneConfig {
                 size: 14.0,
                 weight: 700,
             },
-            text_color: Rgba::hex(0xffffffff),
-            typed_color: Rgba::hex(0xf9e2afff),
-            background: Rgba::hex(0x1e1e2ecc),
+            label: LabelStyle {
+                text_color: Rgba::hex(0xffffffff),
+                typed_color: Rgba::hex(0xf9e2afff),
+                background: Rgba::hex(0x1e1e2ecc),
+                padding: (1.0, 4.0),
+                radius: 0.0,
+                border_width: 0.0,
+                border_color: Rgba::hex(0xffffff40),
+            },
+            backdrop: Rgba::hex(0x00000000),
         }
     }
 }
@@ -395,16 +425,52 @@ fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfi
             )),
         }
     }
+    let label = &mut pane.label;
+    if let Some(padding) = text(parser, "pane:label:padding", warnings) {
+        match parse_padding(&padding) {
+            Some(padding) => label.padding = padding,
+            None => warnings.push(format!(
+                "pane:label:padding = {padding}: expected one or two numbers, like 4 or 1 4"
+            )),
+        }
+    }
     for (key, slot) in [
-        ("pane:text_color", &mut pane.text_color),
-        ("pane:typed_color", &mut pane.typed_color),
-        ("pane:background", &mut pane.background),
+        ("pane:label:radius", &mut label.radius),
+        ("pane:label:border:width", &mut label.border_width),
+    ] {
+        if let Some(value) = number(parser, key, warnings) {
+            if value >= 0.0 {
+                *slot = value as f32;
+            } else {
+                warnings.push(format!("{key} = {value}: can't be negative"));
+            }
+        }
+    }
+    for (key, slot) in [
+        ("pane:label:text_color", &mut label.text_color),
+        ("pane:label:typed_color", &mut label.typed_color),
+        ("pane:label:background", &mut label.background),
+        ("pane:label:border:color", &mut label.border_color),
+        ("pane:backdrop:color", &mut pane.backdrop),
     ] {
         if let Some(color) = color(parser, key, warnings) {
             *slot = color;
         }
     }
     pane
+}
+
+/// CSS-style padding: `4` for every side, or `1 4` for vertical then horizontal.
+fn parse_padding(value: &str) -> Option<(f32, f32)> {
+    let numbers: Vec<f32> = value
+        .split_whitespace()
+        .map(|n| n.parse().ok().filter(|&n: &f32| n >= 0.0))
+        .collect::<Option<_>>()?;
+    match numbers[..] {
+        [all] => Some((all, all)),
+        [vertical, horizontal] => Some((vertical, horizontal)),
+        _ => None,
+    }
 }
 
 /// A number option, or `None` (with a warning if it's set to something else).
@@ -636,7 +702,7 @@ mod tests {
     #[test]
     fn pane_options_are_read() {
         let (config, warnings) = parsed(
-            "pane {\n  spacing = 40\n  chars = asdf\n  font {\n    family = Noto Sans\n    size = 18.5\n    weight = semibold\n  }\n  text_color = rgb(ff0000)\n  typed_color = rgba(00ff0080)\n  background = rgba(0, 0, 255, 0.5)\n}\n",
+            "pane {\n  spacing = 40\n  chars = asdf\n  font {\n    family = Noto Sans\n    size = 18.5\n    weight = semibold\n  }\n  label {\n    text_color = rgb(ff0000)\n    typed_color = rgba(00ff0080)\n    background = rgba(0, 0, 255, 0.5)\n    padding = 2 6\n    radius = 4\n    border {\n      width = 1.5\n      color = rgba(ffffffff)\n    }\n  }\n  backdrop {\n    color = rgba(00000066)\n  }\n}\n",
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         let pane = config.pane;
@@ -650,18 +716,43 @@ mod tests {
                 weight: 600,
             }
         );
-        assert_eq!(pane.text_color, Rgba::hex(0xff0000ff));
-        assert_eq!(pane.typed_color, Rgba::hex(0x00ff0080));
-        assert_eq!(pane.background, Rgba::hex(0x0000ff80));
+        assert_eq!(
+            pane.label,
+            LabelStyle {
+                text_color: Rgba::hex(0xff0000ff),
+                typed_color: Rgba::hex(0x00ff0080),
+                background: Rgba::hex(0x0000ff80),
+                padding: (2.0, 6.0),
+                radius: 4.0,
+                border_width: 1.5,
+                border_color: Rgba::hex(0xffffffff),
+            }
+        );
+        assert_eq!(pane.backdrop, Rgba::hex(0x00000066));
     }
 
     #[test]
     fn bad_pane_options_keep_their_defaults() {
         let (config, warnings) = parsed(
-            "pane {\n  spacing = 0\n  chars = abca\n  font {\n    weight = heavyish\n  }\n  text_color = red\n}\n",
+            "pane {\n  spacing = 0\n  chars = abca\n  font {\n    weight = heavyish\n  }\n  label {\n    text_color = red\n    padding = 1 2 3\n    radius = -1\n  }\n}\n",
         );
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert_eq!(warnings.len(), 6, "{warnings:?}");
         assert_eq!(config.pane, PaneConfig::default());
+    }
+
+    #[test]
+    fn padding_takes_one_or_two_numbers() {
+        assert_eq!(parse_padding("4"), Some((4.0, 4.0)));
+        assert_eq!(parse_padding("1 4.5"), Some((1.0, 4.5)));
+        assert_eq!(parse_padding("1 2 3"), None);
+        assert_eq!(parse_padding("-1"), None);
+        assert_eq!(parse_padding("wide"), None);
+    }
+
+    #[test]
+    fn old_flat_label_options_are_reported() {
+        let (_, warnings) = parsed("pane {\n  background = rgba(000000ff)\n}\n");
+        assert_eq!(warnings, ["unknown option pane:background"]);
     }
 
     #[test]

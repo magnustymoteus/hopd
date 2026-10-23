@@ -1,15 +1,23 @@
-//! Draws pane mode's labels into a shared-memory buffer: tiny-skia for the label
-//! backgrounds, cosmic-text for finding fonts and turning text into glyph pixels.
+//! Draws pane mode's labels into a shared-memory buffer: tiny-skia for shapes (label
+//! boxes, borders, the backdrop), cosmic-text for finding fonts and turning text into glyph
+//! pixels.
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
-use tiny_skia::{Paint, PixmapMut, Rect, Transform};
+use tiny_skia::{FillRule, Paint, Path, PathBuilder, PixmapMut, Rect, Stroke, Transform};
 
 use crate::config::{PaneConfig, Rgba};
 use crate::hints::Hints;
 
-/// Space between a label's text and the edge of its background, in pixels.
-const PADDING_X: f32 = 4.0;
-const PADDING_Y: f32 = 1.0;
+/// The target window's place on the canvas.
+#[derive(Debug, Clone, Copy)]
+pub struct Area {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Corner radius, matching Hyprland's window rounding.
+    pub radius: f32,
+}
 
 pub struct Renderer {
     fonts: FontSystem,
@@ -33,14 +41,14 @@ impl Renderer {
         })
     }
 
-    /// Draws the visible hints onto a transparent `width` × `height` canvas in Wayland's
-    /// ARGB8888 format. `origin` is where the window's top-left corner is on the canvas.
+    /// Draws the backdrop and the visible hints onto a transparent `width` × `height`
+    /// canvas in Wayland's ARGB8888 format. Hint positions are relative to `window`.
     pub fn draw(
         &mut self,
         canvas: &mut [u8],
         width: u32,
         height: u32,
-        origin: (f64, f64),
+        window: Area,
         hints: &Hints,
         style: &PaneConfig,
     ) {
@@ -48,6 +56,28 @@ impl Renderer {
         let Some(mut pixmap) = PixmapMut::from_bytes(canvas, width, height) else {
             return;
         };
+
+        if style.backdrop.a > 0
+            && let Some(path) = rounded_rect(
+                window.x,
+                window.y,
+                window.width,
+                window.height,
+                window.radius,
+            )
+        {
+            pixmap.fill_path(
+                &path,
+                &paint(style.backdrop),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        let label = &style.label;
+        let (padding_y, padding_x) = label.padding;
+        let border = label.border_width;
 
         let family = match &style.font.family {
             Some(name) => Family::Name(name),
@@ -57,11 +87,14 @@ impl Renderer {
             .family(family)
             .weight(Weight(style.font.weight));
         let metrics = Metrics::new(style.font.size, style.font.size * 1.2);
-        let typed_attrs = attrs.clone().color(color(style.typed_color));
-        let rest_attrs = attrs.clone().color(color(style.text_color));
-        let mut background = Paint::default();
-        let Rgba { r, g, b, a } = style.background;
-        background.set_color_rgba8(r, g, b, a);
+        let typed_attrs = attrs.clone().color(color(label.typed_color));
+        let rest_attrs = attrs.clone().color(color(label.text_color));
+        let background = paint(label.background);
+        let border_paint = paint(label.border_color);
+        let stroke = Stroke {
+            width: border,
+            ..Stroke::default()
+        };
 
         let typed: String = hints.typed().iter().collect();
         for hint in hints.visible() {
@@ -80,24 +113,42 @@ impl Renderer {
             let text_width = text.layout_runs().map(|run| run.line_w).fold(0.0, f32::max);
             let text_height = metrics.line_height;
 
-            let center_x = (origin.0 + hint.x) as f32;
-            let center_y = (origin.1 + hint.y) as f32;
-            let left = (center_x - text_width / 2.0).round();
-            let top = (center_y - text_height / 2.0).round();
-            if let Some(rect) = Rect::from_xywh(
-                left - PADDING_X,
-                top - PADDING_Y,
-                text_width + 2.0 * PADDING_X,
-                text_height + 2.0 * PADDING_Y,
-            ) {
-                pixmap.fill_rect(rect, &background, Transform::identity(), None);
+            // The box: text, padding around it, then the border around that.
+            let box_width = text_width + 2.0 * (padding_x + border);
+            let box_height = text_height + 2.0 * (padding_y + border);
+            let box_left = (window.x + hint.x as f32 - box_width / 2.0).round();
+            let box_top = (window.y + hint.y as f32 - box_height / 2.0).round();
+            if let Some(path) = rounded_rect(box_left, box_top, box_width, box_height, label.radius)
+            {
+                pixmap.fill_path(
+                    &path,
+                    &background,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
+            // A stroke is centred on its path, so the path runs half a border width inside
+            // the box's edge to keep the whole border within the box.
+            if border > 0.0
+                && let Some(path) = rounded_rect(
+                    box_left + border / 2.0,
+                    box_top + border / 2.0,
+                    box_width - border,
+                    box_height - border,
+                    label.radius - border / 2.0,
+                )
+            {
+                pixmap.stroke_path(&path, &border_paint, &stroke, Transform::identity(), None);
+            }
+            let left = box_left + border + padding_x;
+            let top = box_top + border + padding_y;
 
             let pixels = pixmap.data_mut();
             text.draw(
                 &mut self.fonts,
                 &mut self.glyphs,
-                color(style.text_color),
+                color(label.text_color),
                 |x, y, w, h, color| {
                     blend(
                         pixels,
@@ -120,6 +171,49 @@ impl Renderer {
 
 fn color(Rgba { r, g, b, a }: Rgba) -> Color {
     Color::rgba(r, g, b, a)
+}
+
+fn paint(Rgba { r, g, b, a }: Rgba) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(r, g, b, a);
+    paint
+}
+
+/// A rectangle with circular corners of `radius`, clamped so that a large radius gives
+/// a pill shape instead of overlapping corners.
+fn rounded_rect(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Option<Path> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let r = radius.clamp(0.0, width.min(height) / 2.0);
+    if r == 0.0 {
+        return Some(PathBuilder::from_rect(Rect::from_xywh(
+            x, y, width, height,
+        )?));
+    }
+    // Distance of the control points from each corner's ends: the standard cubic
+    // approximation of a quarter circle.
+    let k = 0.552_284_8 * r;
+    let (right, bottom) = (x + width, y + height);
+    let mut path = PathBuilder::new();
+    path.move_to(x + r, y);
+    path.line_to(right - r, y);
+    path.cubic_to(right - r + k, y, right, y + r - k, right, y + r);
+    path.line_to(right, bottom - r);
+    path.cubic_to(
+        right,
+        bottom - r + k,
+        right - r + k,
+        bottom,
+        right - r,
+        bottom,
+    );
+    path.line_to(x + r, bottom);
+    path.cubic_to(x + r - k, bottom, x, bottom - r + k, x, bottom - r);
+    path.line_to(x, y + r);
+    path.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    path.close();
+    path.finish()
 }
 
 /// Paints a `size` rectangle at `at` in `color` over premultiplied RGBA `pixels`, clipped
@@ -150,6 +244,23 @@ fn blend(pixels: &mut [u8], canvas: (u32, u32), at: (i32, i32), size: (u32, u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounded_rects_keep_their_bounds() {
+        for radius in [0.0, 4.0, 1000.0] {
+            let path = rounded_rect(10.0, 20.0, 30.0, 12.0, radius).unwrap();
+            assert_eq!(
+                path.bounds(),
+                Rect::from_xywh(10.0, 20.0, 30.0, 12.0).unwrap(),
+                "radius {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_rects_draw_nothing() {
+        assert!(rounded_rect(0.0, 0.0, 0.0, 10.0, 2.0).is_none());
+    }
 
     #[test]
     fn opaque_colour_replaces_the_pixel() {
