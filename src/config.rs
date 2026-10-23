@@ -7,6 +7,10 @@
 //!         initial = 220
 //!     }
 //! }
+//! pane {
+//!     spacing = 60
+//!     background = rgba(1e1e2ecc)
+//! }
 //! ```
 
 use std::fmt;
@@ -48,6 +52,33 @@ const DEFAULT_SCROLL_SPEED: Speed = Speed {
 /// Options hyprhopd understands, besides `normal:bind`.
 const SPEED_OPTIONS: [&str; 2] = ["speed", "scroll_speed"];
 const SPEED_FIELDS: [&str; 3] = ["initial", "acceleration", "max"];
+const PANE_OPTIONS: [&str; 8] = [
+    "pane:spacing",
+    "pane:chars",
+    "pane:font:family",
+    "pane:font:size",
+    "pane:font:weight",
+    "pane:text_color",
+    "pane:typed_color",
+    "pane:background",
+];
+
+/// Smallest allowed `pane:spacing`, in pixels.
+const MIN_SPACING: f64 = 10.0;
+
+/// CSS-style weight names, as fontconfig and cosmic-text number them.
+const WEIGHTS: [(&str, u16); 10] = [
+    ("thin", 100),
+    ("extralight", 200),
+    ("light", 300),
+    ("normal", 400),
+    ("regular", 400),
+    ("medium", 500),
+    ("semibold", 600),
+    ("bold", 700),
+    ("extrabold", 800),
+    ("black", 900),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bind {
@@ -88,9 +119,66 @@ pub struct NormalConfig {
     pub scroll_speed: Speed,
 }
 
+/// An sRGB colour with straight (not premultiplied) alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl Rgba {
+    const fn hex(rgba: u32) -> Rgba {
+        let [r, g, b, a] = rgba.to_be_bytes();
+        Rgba { r, g, b, a }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Font {
+    /// A font family name; `None` means the system's monospace font.
+    pub family: Option<String>,
+    /// In pixels.
+    pub size: f32,
+    /// 100 (thin) to 900 (black).
+    pub weight: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneConfig {
+    /// Distance between neighbouring label centres, in pixels.
+    pub spacing: f64,
+    /// Characters labels are made of, in the order labels use them.
+    pub chars: Vec<char>,
+    pub font: Font,
+    pub text_color: Rgba,
+    /// Colour of the letters already typed.
+    pub typed_color: Rgba,
+    pub background: Rgba,
+}
+
+impl Default for PaneConfig {
+    fn default() -> PaneConfig {
+        PaneConfig {
+            spacing: 60.0,
+            chars: ('a'..='z').collect(),
+            font: Font {
+                family: None,
+                size: 14.0,
+                weight: 700,
+            },
+            text_color: Rgba::hex(0xffffffff),
+            typed_color: Rgba::hex(0xf9e2afff),
+            background: Rgba::hex(0x1e1e2ecc),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub normal: NormalConfig,
+    pub pane: PaneConfig,
 }
 
 impl Default for Config {
@@ -104,8 +192,17 @@ impl Default for Config {
                 speed: DEFAULT_SPEED,
                 scroll_speed: DEFAULT_SCROLL_SPEED,
             },
+            pane: PaneConfig::default(),
         }
     }
+}
+
+/// warpd's default binds for `action`, used when none of its configured binds install.
+pub fn default_binds(action: Action) -> impl Iterator<Item = Bind> {
+    DEFAULT_BINDS
+        .into_iter()
+        .filter(move |&(_, default)| default == action)
+        .map(|(key, action)| Bind::default_for(key, action))
 }
 
 /// The outcome of reading the config file.
@@ -179,6 +276,7 @@ fn parse_with(run: impl FnOnce(&mut hyprlang::Config) -> ParseResult<()>) -> Loa
     config.normal.speed = read_speed(&parser, "speed", DEFAULT_SPEED, &mut warnings);
     config.normal.scroll_speed =
         read_speed(&parser, "scroll_speed", DEFAULT_SCROLL_SPEED, &mut warnings);
+    config.pane = read_pane(&parser, &mut warnings);
 
     let mut unknown: Vec<&str> = parser
         .keys()
@@ -261,7 +359,144 @@ fn read_speed(
     speed
 }
 
+fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfig {
+    let mut pane = PaneConfig::default();
+    if let Some(spacing) = number(parser, "pane:spacing", warnings) {
+        // Below this, a window would need thousands of labels.
+        if spacing >= MIN_SPACING {
+            pane.spacing = spacing;
+        } else {
+            warnings.push(format!(
+                "pane:spacing = {spacing}: must be at least {MIN_SPACING}"
+            ));
+        }
+    }
+    if let Some(chars) = text(parser, "pane:chars", warnings) {
+        match parse_chars(&chars) {
+            Ok(chars) => pane.chars = chars,
+            Err(reason) => warnings.push(format!("pane:chars = {chars}: {reason}")),
+        }
+    }
+    if let Some(family) = text(parser, "pane:font:family", warnings) {
+        pane.font.family = Some(family);
+    }
+    if let Some(size) = number(parser, "pane:font:size", warnings) {
+        if size > 0.0 {
+            pane.font.size = size as f32;
+        } else {
+            warnings.push(format!("pane:font:size = {size}: must be positive"));
+        }
+    }
+    if let Some(weight) = text(parser, "pane:font:weight", warnings) {
+        match parse_weight(&weight) {
+            Some(weight) => pane.font.weight = weight,
+            None => warnings.push(format!(
+                "pane:font:weight = {weight}: expected thin, light, normal, medium, bold, black, ... or 100 to 900"
+            )),
+        }
+    }
+    for (key, slot) in [
+        ("pane:text_color", &mut pane.text_color),
+        ("pane:typed_color", &mut pane.typed_color),
+        ("pane:background", &mut pane.background),
+    ] {
+        if let Some(color) = color(parser, key, warnings) {
+            *slot = color;
+        }
+    }
+    pane
+}
+
+/// A number option, or `None` (with a warning if it's set to something else).
+fn number(parser: &hyprlang::Config, key: &str, warnings: &mut Vec<String>) -> Option<f64> {
+    match parser.get(key).ok()? {
+        ConfigValue::Int(n) => Some(*n as f64),
+        ConfigValue::Float(n) => Some(*n),
+        other => {
+            warnings.push(format!("{key} = {other}: expected a number"));
+            None
+        }
+    }
+}
+
+/// A text option. Numbers count as text too, so `chars = 1234` works.
+fn text(parser: &hyprlang::Config, key: &str, warnings: &mut Vec<String>) -> Option<String> {
+    match parser.get(key).ok()? {
+        ConfigValue::String(s) => Some(s.clone()),
+        ConfigValue::Int(n) => Some(n.to_string()),
+        ConfigValue::Float(n) => Some(n.to_string()),
+        other => {
+            warnings.push(format!("{key} = {other}: expected text"));
+            None
+        }
+    }
+}
+
+/// A colour option: `rgba(RRGGBBAA)` and `rgba(r, g, b, a)` arrive parsed, `rgb(RRGGBB)`
+/// as text.
+fn color(parser: &hyprlang::Config, key: &str, warnings: &mut Vec<String>) -> Option<Rgba> {
+    let parsed = match parser.get(key).ok()? {
+        ConfigValue::Color(c) => Some(Rgba {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }),
+        ConfigValue::String(s) => parse_rgb(s),
+        _ => None,
+    };
+    if parsed.is_none() {
+        let value = parser.get(key).map(|v| v.to_string()).unwrap_or_default();
+        warnings.push(format!(
+            "{key} = {value}: expected rgba(RRGGBBAA) or rgb(RRGGBB)"
+        ));
+    }
+    parsed
+}
+
+/// `rgb(RRGGBB)`, which hyprlang leaves as text.
+fn parse_rgb(value: &str) -> Option<Rgba> {
+    let hex = value.trim().strip_prefix("rgb(")?.strip_suffix(')')?.trim();
+    if hex.len() != 6 {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    Some(Rgba::hex(rgb << 8 | 0xff))
+}
+
+fn parse_chars(value: &str) -> Result<Vec<char>, String> {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.iter().any(|c| c.is_whitespace()) {
+        return Err("labels can't contain spaces".to_string());
+    }
+    if let Some((i, c)) = chars
+        .iter()
+        .enumerate()
+        .find(|&(i, c)| chars[..i].contains(c))
+    {
+        return Err(format!("'{c}' appears twice (position {})", i + 1));
+    }
+    if chars.len() < 2 {
+        return Err("needs at least two characters".to_string());
+    }
+    Ok(chars)
+}
+
+fn parse_weight(value: &str) -> Option<u16> {
+    let value = value.trim().to_lowercase();
+    if let Some(&(_, weight)) = WEIGHTS.iter().find(|&&(name, _)| name == value) {
+        return Some(weight);
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|weight| (1..=1000).contains(weight))
+}
+
 fn is_known_option(key: &str) -> bool {
+    if PANE_OPTIONS.contains(&key) {
+        return true;
+    }
     let mut parts = key.split(':');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("normal"), Some(option), Some(field), None) => {
@@ -396,6 +631,52 @@ mod tests {
             warnings,
             ["unknown option normal:sped:max", "unknown option speed"]
         );
+    }
+
+    #[test]
+    fn pane_options_are_read() {
+        let (config, warnings) = parsed(
+            "pane {\n  spacing = 40\n  chars = asdf\n  font {\n    family = Noto Sans\n    size = 18.5\n    weight = semibold\n  }\n  text_color = rgb(ff0000)\n  typed_color = rgba(00ff0080)\n  background = rgba(0, 0, 255, 0.5)\n}\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let pane = config.pane;
+        assert_eq!(pane.spacing, 40.0);
+        assert_eq!(pane.chars, ['a', 's', 'd', 'f']);
+        assert_eq!(
+            pane.font,
+            Font {
+                family: Some("Noto Sans".into()),
+                size: 18.5,
+                weight: 600,
+            }
+        );
+        assert_eq!(pane.text_color, Rgba::hex(0xff0000ff));
+        assert_eq!(pane.typed_color, Rgba::hex(0x00ff0080));
+        assert_eq!(pane.background, Rgba::hex(0x0000ff80));
+    }
+
+    #[test]
+    fn bad_pane_options_keep_their_defaults() {
+        let (config, warnings) = parsed(
+            "pane {\n  spacing = 0\n  chars = abca\n  font {\n    weight = heavyish\n  }\n  text_color = red\n}\n",
+        );
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert_eq!(config.pane, PaneConfig::default());
+    }
+
+    #[test]
+    fn label_chars_need_two_distinct_non_space_characters() {
+        assert_eq!(parse_chars("12"), Ok(vec!['1', '2']));
+        assert!(parse_chars("a").is_err());
+        assert!(parse_chars("a b").is_err());
+        assert!(parse_chars("aba").is_err());
+    }
+
+    #[test]
+    fn default_binds_exist_for_every_normal_mode_action() {
+        for action in Action::ALL.into_iter().filter(|a| a.in_normal_mode()) {
+            assert!(default_binds(action).next().is_some(), "{action:?}");
+        }
     }
 
     #[test]

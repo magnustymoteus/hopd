@@ -5,6 +5,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use serde::Deserialize;
+
 /// The directory holding this Hyprland instance's sockets.
 fn socket_dir() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR");
@@ -52,6 +54,72 @@ pub fn reset_submap() -> Result<(), String> {
 
 pub fn current_submap() -> Result<String, String> {
     request("submap").map_err(|err| err.to_string())
+}
+
+/// A window as `hyprctl activewindow -j` describes it, in layout coordinates.
+#[derive(Debug, Deserialize)]
+pub struct Window {
+    /// Like `0x5617571353a0`. Events name windows without the `0x`.
+    pub address: String,
+    pub at: [i32; 2],
+    pub size: [i32; 2],
+    /// The monitor's id.
+    pub monitor: i64,
+}
+
+impl Window {
+    /// The address as events write it.
+    pub fn event_address(&self) -> &str {
+        self.address.trim_start_matches("0x")
+    }
+}
+
+/// A monitor as `hyprctl monitors -j` describes it.
+#[derive(Debug, Deserialize)]
+pub struct Monitor {
+    pub id: i64,
+    pub name: String,
+    /// Top-left corner in layout coordinates.
+    pub x: i32,
+    pub y: i32,
+    /// In physical pixels, before scale and rotation.
+    pub width: i32,
+    pub height: i32,
+    pub scale: f64,
+    /// 0-7, as in wl_output; odd values are rotated by 90 or 270 degrees.
+    pub transform: i32,
+}
+
+impl Monitor {
+    /// Width and height in layout coordinates.
+    pub fn logical_size(&self) -> (f64, f64) {
+        let (w, h) = (
+            f64::from(self.width) / self.scale,
+            f64::from(self.height) / self.scale,
+        );
+        if self.transform % 2 == 1 {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    }
+}
+
+/// The focused window, if there is one.
+pub fn active_window() -> Result<Option<Window>, String> {
+    let reply = request("j/activewindow").map_err(|err| err.to_string())?;
+    // With nothing focused, Hyprland answers `{}`.
+    if reply == "{}" {
+        return Ok(None);
+    }
+    serde_json::from_str(&reply)
+        .map(Some)
+        .map_err(|err| format!("unexpected activewindow reply: {err}"))
+}
+
+pub fn monitors() -> Result<Vec<Monitor>, String> {
+    let reply = request("j/monitors").map_err(|err| err.to_string())?;
+    serde_json::from_str(&reply).map_err(|err| format!("unexpected monitors reply: {err}"))
 }
 
 /// Connects to the event socket, which streams lines like `configreloaded>>`.

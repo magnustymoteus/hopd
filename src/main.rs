@@ -1,8 +1,11 @@
 mod config;
 mod handlers;
+mod hints;
 mod hyprland;
 mod motion;
+mod pane;
 mod protocol;
+mod render;
 
 use std::io::{ErrorKind, Read};
 use std::os::fd::AsFd;
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 use inotify::{Inotify, WatchMask};
 
 use smithay_client_toolkit::{
+    compositor::CompositorState,
     output::OutputState,
     reexports::{
         calloop::{
@@ -28,18 +32,26 @@ use smithay_client_toolkit::{
         },
     },
     registry::RegistryState,
+    seat::SeatState,
+    shell::wlr_layer::LayerShell,
+    shm::{Shm, slot::SlotPool},
 };
 use wayland_client::{
-    Connection,
+    Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::wl_pointer::{Axis, AxisSource, ButtonState},
+    protocol::{
+        wl_keyboard::WlKeyboard,
+        wl_pointer::{Axis, AxisSource, ButtonState},
+    },
 };
 
 use config::{Config, Loaded};
 use handlers::{ManagerData, VirtualPointerData};
 use motion::{Direction, HeldKeys, ScrollDirection, ScrollKeys, Speed};
+use pane::PaneMode;
 use protocol::global_shortcuts::hyprland_global_shortcut_v1::HyprlandGlobalShortcutV1;
 use protocol::global_shortcuts::hyprland_global_shortcuts_manager_v1::HyprlandGlobalShortcutsManagerV1;
+use render::Renderer;
 
 /// The app_id Hyprland binds refer to, as in `hyprhopd:normal`.
 const APP_ID: &str = "hyprhopd";
@@ -49,10 +61,6 @@ const SUBMAP_PREFIX: &str = "hyprhopd-";
 
 /// Tick rate used when no monitor reports its refresh rate, in millihertz.
 const FALLBACK_REFRESH_MHZ: i32 = 120_000;
-
-/// Exit key installed when none of the configured exit binds could be: without one, the
-/// catch-all would swallow the whole keyboard.
-const FALLBACK_EXIT_KEY: &str = "escape";
 
 /// How long config warnings stay on screen.
 const WARNING_DURATION_MS: u32 = 10_000;
@@ -167,6 +175,14 @@ struct ActiveMode {
 pub struct State {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    shm: Shm,
+    /// Shared memory pane mode draws its overlay into.
+    pool: SlotPool,
+    keyboard: Option<WlKeyboard>,
+    renderer: Renderer,
     virtual_pointer: ZwlrVirtualPointerV1,
     loop_handle: LoopHandle<'static, State>,
     /// Reference point for the millisecond timestamps virtual-pointer events carry.
@@ -185,6 +201,7 @@ pub struct State {
     /// Watches the config file's directory; absent if that couldn't be set up.
     config_watch: Option<Inotify>,
     mode: Option<ActiveMode>,
+    pane: Option<PaneMode>,
 }
 
 fn main() -> ExitCode {
@@ -209,6 +226,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pointer_manager: ZwlrVirtualPointerManagerV1 = globals
         .bind(&qh, 1..=2, VirtualPointerData)
         .map_err(|_| "compositor does not support zwlr_virtual_pointer_manager_v1")?;
+    let compositor = CompositorState::bind(&globals, &qh)
+        .map_err(|_| "compositor does not support wl_compositor")?;
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .map_err(|_| "compositor does not support zwlr_layer_shell_v1")?;
+    let shm = Shm::bind(&globals, &qh).map_err(|_| "compositor does not support wl_shm")?;
+    // Grows on demand; pane mode's first buffer sets the real size.
+    let pool = SlotPool::new(4, &shm)?;
     // No seat given: Hyprland attaches it to the default seat.
     let virtual_pointer = pointer_manager.create_virtual_pointer(None, &qh, VirtualPointerData);
 
@@ -232,6 +256,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        compositor,
+        layer_shell,
+        shm,
+        pool,
+        keyboard: None,
+        renderer: Renderer::new(),
         virtual_pointer,
         loop_handle: event_loop.handle(),
         started: Instant::now(),
@@ -243,6 +274,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_path: config::path(),
         config_watch: None,
         mode: None,
+        pane: None,
     };
 
     // Flush the registrations and surface any protocol error right away.
@@ -301,8 +333,16 @@ impl State {
         let mut warnings = Vec::new();
         match self.config_path.as_deref().map(config::load) {
             Some(Loaded::Parsed(config, problems)) => {
-                self.config = config;
                 warnings = problems;
+                // cosmic-text silently falls back for unknown fonts, so check here.
+                if let Some(family) = &config.pane.font.family
+                    && !self.renderer.has_family(family)
+                {
+                    warnings.push(format!(
+                        "pane:font:family = {family}: no such font installed, using a fallback"
+                    ));
+                }
+                self.config = config;
             }
             Some(Loaded::Missing) => {
                 println!("hyprhopd: no config file, using the defaults");
@@ -347,32 +387,37 @@ impl State {
             self.submap_generation
         );
         let mut warnings = Vec::new();
-        let mut has_exit = false;
+        let mut installed = Vec::new();
         // One request per bind, so Hyprland's error names the bind it rejected.
         for bind in &self.config.normal.binds {
-            let key = hyprland::key_string(&bind.mods, &bind.key);
-            let lua = if bind.action == Action::Exit {
-                hyprland::exit_bind_lua(&name, &key, APP_ID, bind.action.id())
-            } else {
-                hyprland::bind_lua(&name, &key, APP_ID, bind.action.id())
-            };
-            match hyprland::eval(&lua) {
-                Ok(()) => has_exit |= bind.action == Action::Exit,
-                Err(err) => {
-                    warnings.push(format!("normal: {bind}: {}", hyprland::bind_error(&err)))
+            match install_bind(&name, bind) {
+                Ok(()) => installed.push(bind.action),
+                Err(err) => warnings.push(format!("normal: {bind}: {err}")),
+            }
+        }
+        // An action whose binds were all rejected gets its default keys back. For exit this
+        // is essential: without it, the catch-all would swallow the whole keyboard.
+        for action in Action::ALL.into_iter().filter(|a| a.in_normal_mode()) {
+            if installed.contains(&action) {
+                continue;
+            }
+            for bind in config::default_binds(action) {
+                match install_bind(&name, &bind) {
+                    Ok(()) => {
+                        installed.push(action);
+                        warnings.push(format!(
+                            "normal: no bind for {} could be installed, using the default {bind}",
+                            action.id()
+                        ));
+                    }
+                    Err(err) => warnings.push(format!("normal: {bind}: {err}")),
                 }
             }
         }
-        if !has_exit {
-            warnings.push(format!(
-                "normal: no exit bind could be installed, using {FALLBACK_EXIT_KEY}"
-            ));
-            let lua = hyprland::exit_bind_lua(&name, FALLBACK_EXIT_KEY, APP_ID, Action::Exit.id());
-            if let Err(err) = hyprland::eval(&lua) {
-                eprintln!("hyprhopd: cannot install the normal-mode submap: {err}");
-                self.submap = None;
-                return warnings;
-            }
+        if !installed.contains(&Action::Exit) {
+            eprintln!("hyprhopd: normal mode is unavailable: no exit bind could be installed");
+            self.submap = None;
+            return warnings;
         }
         // Last, so it's clear every real bind went in first.
         if let Err(err) = hyprland::eval(&hyprland::catchall_lua(&name)) {
@@ -477,14 +522,15 @@ impl State {
             "submap" if self.mode.as_ref().is_some_and(|mode| mode.submap != data) => {
                 self.exit_mode();
             }
+            _ if self.pane.is_some() => self.pane_hyprland_event(event, data),
             _ => {}
         }
     }
 
-    fn shortcut_event(&mut self, action: Action, pressed: bool) {
+    fn shortcut_event(&mut self, action: Action, pressed: bool, qh: &QueueHandle<State>) {
         match (action, pressed) {
             (Action::Normal, true) => self.enter_normal_mode(),
-            (Action::Pane, true) => println!("pane mode isn't implemented yet"),
+            (Action::Pane, true) => self.enter_pane_mode(qh),
             (Action::Exit, true) => self.exit_mode(),
             (Action::Move(direction), _) => self.set_moving(direction, pressed),
             (Action::Scroll(direction), _) => self.set_scrolling(direction, pressed),
@@ -494,7 +540,7 @@ impl State {
     }
 
     fn enter_normal_mode(&mut self) {
-        if self.mode.is_some() {
+        if self.mode.is_some() || self.pane.is_some() {
             return;
         }
         let Some(submap) = self.submap.clone() else {
@@ -698,4 +744,15 @@ impl State {
     fn timestamp(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
     }
+}
+
+/// Adds one normal-mode bind to submap `name`, returning Hyprland's reason if it refuses.
+fn install_bind(name: &str, bind: &config::Bind) -> Result<(), String> {
+    let key = hyprland::key_string(&bind.mods, &bind.key);
+    let lua = if bind.action == Action::Exit {
+        hyprland::exit_bind_lua(name, &key, APP_ID, bind.action.id())
+    } else {
+        hyprland::bind_lua(name, &key, APP_ID, bind.action.id())
+    };
+    hyprland::eval(&lua).map_err(|err| hyprland::bind_error(&err).to_string())
 }
