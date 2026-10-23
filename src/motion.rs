@@ -17,7 +17,7 @@ impl Direction {
 }
 
 /// How fast the pointer moves, in pixels per second.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed {
     /// Speed the moment a movement key is pressed.
     pub initial: f64,

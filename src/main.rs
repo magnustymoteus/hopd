@@ -1,12 +1,17 @@
+mod config;
 mod handlers;
 mod hyprland;
 mod motion;
 mod protocol;
 
 use std::io::{ErrorKind, Read};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+
+use inotify::{Inotify, WatchMask};
 
 use smithay_client_toolkit::{
     output::OutputState,
@@ -30,6 +35,7 @@ use wayland_client::{
     protocol::wl_pointer::{Axis, AxisSource, ButtonState},
 };
 
+use config::{Config, Loaded};
 use handlers::{ManagerData, VirtualPointerData};
 use motion::{Direction, HeldKeys, ScrollDirection, ScrollKeys, Speed};
 use protocol::global_shortcuts::hyprland_global_shortcut_v1::HyprlandGlobalShortcutV1;
@@ -41,38 +47,15 @@ const APP_ID: &str = "hyprhopd";
 /// Prefix of the submaps hyprhopd installs; see `State::install_submap`.
 const SUBMAP_PREFIX: &str = "hyprhopd-";
 
-/// Pointer speed in normal mode. Hard-coded until the config file exists.
-const SPEED: Speed = Speed {
-    initial: 220.0,
-    acceleration: 700.0,
-    max: 1600.0,
-};
-
-/// Scroll speed in scroll units per second (warpd's defaults). Hard-coded until the config
-/// file exists.
-const SCROLL_SPEED: Speed = Speed {
-    initial: 300.0,
-    acceleration: 1600.0,
-    max: 9000.0,
-};
-
 /// Tick rate used when no monitor reports its refresh rate, in millihertz.
 const FALLBACK_REFRESH_MHZ: i32 = 120_000;
 
-/// Normal-mode keys, in Hyprland's key names. Hard-coded to warpd's defaults until the
-/// config file exists.
-const NORMAL_KEYS: [(&str, Action); 9] = [
-    ("h", Action::Move(Direction::Left)),
-    ("j", Action::Move(Direction::Down)),
-    ("k", Action::Move(Direction::Up)),
-    ("l", Action::Move(Direction::Right)),
-    ("e", Action::Scroll(ScrollDirection::Down)),
-    ("r", Action::Scroll(ScrollDirection::Up)),
-    ("m", Action::Button(MouseButton::Left)),
-    ("comma", Action::Button(MouseButton::Middle)),
-    ("period", Action::Button(MouseButton::Right)),
-];
-const EXIT_KEY: &str = "escape";
+/// Exit key installed when none of the configured exit binds could be: without one, the
+/// catch-all would swallow the whole keyboard.
+const FALLBACK_EXIT_KEY: &str = "escape";
+
+/// How long config warnings stay on screen.
+const WARNING_DURATION_MS: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -147,10 +130,26 @@ impl Action {
             Action::Button(_) => "Press a mouse button (normal mode)",
         }
     }
+
+    /// The action whose shortcut id, and config name, is `id`.
+    fn from_id(id: &str) -> Option<Action> {
+        Action::ALL.into_iter().find(|action| action.id() == id)
+    }
+
+    /// Whether the action can be bound inside normal mode.
+    fn in_normal_mode(self) -> bool {
+        !matches!(self, Action::Normal | Action::Pane)
+    }
 }
 
 /// State of normal mode while it is active.
 struct ActiveMode {
+    /// The submap this run of the mode entered. A config reload installs a newer one,
+    /// which applies the next time the mode starts.
+    submap: String,
+    /// Speeds as configured when the mode started, for the same reason.
+    speed: Speed,
+    scroll_speed: Speed,
     held: HeldKeys,
     /// When the current run of held movement keys started; acceleration counts from here.
     held_since: Option<Instant>,
@@ -181,6 +180,10 @@ pub struct State {
     submap_generation: u32,
     /// Unfinished line from the event socket.
     event_buffer: String,
+    config: Config,
+    config_path: Option<PathBuf>,
+    /// Watches the config file's directory; absent if that couldn't be set up.
+    config_watch: Option<Inotify>,
     mode: Option<ActiveMode>,
 }
 
@@ -236,6 +239,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         submap: None,
         submap_generation: 0,
         event_buffer: String::new(),
+        config: Config::default(),
+        config_path: config::path(),
+        config_watch: None,
         mode: None,
     };
 
@@ -249,7 +255,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("hyprhopd: cannot reset the submap: {err}");
         }
     }
-    state.install_submap();
+    state.reload_config();
+
+    match state.watch_config() {
+        Ok(watch) => {
+            // calloop owns a duplicate of the fd and only wakes the loop; the events are
+            // read through `config_watch`.
+            let fd = watch.as_fd().try_clone_to_owned()?;
+            state.config_watch = Some(watch);
+            event_loop
+                .handle()
+                .insert_source(
+                    Generic::new(fd, Interest::READ, Mode::Level),
+                    |_, _, state| Ok(state.read_config_events()),
+                )
+                .map_err(|e| format!("cannot add the config watch to the event loop: {e}"))?;
+        }
+        Err(err) => eprintln!("hyprhopd: config changes won't apply until restart: {err}"),
+    }
 
     let events = hyprland::event_stream()
         .map_err(|e| format!("cannot connect to Hyprland's event socket: {e}"))?;
@@ -272,32 +295,145 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl State {
-    /// Defines a fresh submap with hyprhopd's normal-mode keys. Each install gets a new
-    /// name instead of replacing the old submap: redefining appends duplicate binds, and
-    /// Hyprland's unbind would also remove the user's own binds for the same keys. Old
-    /// submaps are never entered again and vanish on the next Hyprland reload.
-    fn install_submap(&mut self) {
+    /// Reads the config file again and installs a submap with its binds. Problems are
+    /// printed and shown as one Hyprland notification.
+    fn reload_config(&mut self) {
+        let mut warnings = Vec::new();
+        match self.config_path.as_deref().map(config::load) {
+            Some(Loaded::Parsed(config, problems)) => {
+                self.config = config;
+                warnings = problems;
+            }
+            Some(Loaded::Missing) => {
+                println!("hyprhopd: no config file, using the defaults");
+                self.config = Config::default();
+            }
+            // Keep the current config, so a half-typed edit doesn't wipe the binds.
+            Some(Loaded::Broken(err)) => {
+                self.report(&[format!("{err} (config not applied)")]);
+                return;
+            }
+            None => {
+                println!("hyprhopd: neither XDG_CONFIG_HOME nor HOME is set, using the defaults")
+            }
+        }
+        warnings.extend(self.install_submap());
+        self.report(&warnings);
+    }
+
+    fn report(&self, warnings: &[String]) {
+        if warnings.is_empty() {
+            return;
+        }
+        for warning in warnings {
+            eprintln!("hyprhopd: {warning}");
+        }
+        let message = format!("hyprhopd.conf: {}", warnings.join("; "));
+        if let Err(err) = hyprland::notify(&message, WARNING_DURATION_MS) {
+            eprintln!("hyprhopd: cannot show a notification: {err}");
+        }
+    }
+
+    /// Defines a fresh submap with the configured normal-mode binds and returns a warning
+    /// for each bind Hyprland rejected. Each install gets a new name instead of replacing
+    /// the old submap: redefining appends duplicate binds, and Hyprland's unbind would also
+    /// remove the user's own binds for the same keys. Old submaps are never entered again
+    /// and vanish on the next Hyprland reload.
+    fn install_submap(&mut self) -> Vec<String> {
         self.submap_generation += 1;
         let name = format!(
             "{SUBMAP_PREFIX}{}-{}",
             std::process::id(),
             self.submap_generation
         );
-        let binds: Vec<(&str, &str)> = NORMAL_KEYS
-            .iter()
-            .map(|&(key, action)| (key, action.id()))
-            .collect();
-        let lua = hyprland::submap_lua(&name, APP_ID, &binds, EXIT_KEY, Action::Exit.id());
-        match hyprland::eval(&lua) {
-            Ok(()) => {
-                println!("hyprhopd: installed submap {name}");
-                self.submap = Some(name);
-            }
-            Err(err) => {
-                eprintln!("hyprhopd: cannot install the normal-mode submap: {err}");
-                self.submap = None;
+        let mut warnings = Vec::new();
+        let mut has_exit = false;
+        // One request per bind, so Hyprland's error names the bind it rejected.
+        for bind in &self.config.normal.binds {
+            let key = hyprland::key_string(&bind.mods, &bind.key);
+            let lua = if bind.action == Action::Exit {
+                hyprland::exit_bind_lua(&name, &key, APP_ID, bind.action.id())
+            } else {
+                hyprland::bind_lua(&name, &key, APP_ID, bind.action.id())
+            };
+            match hyprland::eval(&lua) {
+                Ok(()) => has_exit |= bind.action == Action::Exit,
+                Err(err) => {
+                    warnings.push(format!("normal: {bind}: {}", hyprland::bind_error(&err)))
+                }
             }
         }
+        if !has_exit {
+            warnings.push(format!(
+                "normal: no exit bind could be installed, using {FALLBACK_EXIT_KEY}"
+            ));
+            let lua = hyprland::exit_bind_lua(&name, FALLBACK_EXIT_KEY, APP_ID, Action::Exit.id());
+            if let Err(err) = hyprland::eval(&lua) {
+                eprintln!("hyprhopd: cannot install the normal-mode submap: {err}");
+                self.submap = None;
+                return warnings;
+            }
+        }
+        // Last, so it's clear every real bind went in first.
+        if let Err(err) = hyprland::eval(&hyprland::catchall_lua(&name)) {
+            warnings.push(format!("normal: other keys won't be blocked: {err}"));
+        }
+        println!("hyprhopd: installed submap {name}");
+        self.submap = Some(name);
+        warnings
+    }
+
+    /// Watches the directory rather than the file: editors often save by writing a new
+    /// file and renaming it over the old one, which would end a watch on the file itself.
+    fn watch_config(&self) -> Result<Inotify, String> {
+        let dir = self
+            .config_path
+            .as_deref()
+            .and_then(|path| path.parent())
+            .ok_or("no config directory")?;
+        let inotify = Inotify::init().map_err(|e| e.to_string())?;
+        inotify
+            .watches()
+            .add(dir, WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO)
+            .map_err(|e| format!("cannot watch {}: {e}", dir.display()))?;
+        Ok(inotify)
+    }
+
+    /// Reloads the config once if any pending event concerns the config file.
+    fn read_config_events(&mut self) -> PostAction {
+        let Some(watch) = self.config_watch.as_mut() else {
+            return PostAction::Remove;
+        };
+        let file_name = self
+            .config_path
+            .as_deref()
+            .and_then(|path| path.file_name());
+        let mut buffer = [0u8; 4096];
+        let mut changed = false;
+        loop {
+            match watch.read_events(&mut buffer) {
+                Ok(events) => {
+                    let mut any = false;
+                    for event in events {
+                        any = true;
+                        changed |= event.name.is_some() && event.name == file_name;
+                    }
+                    if !any {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    eprintln!("hyprhopd: cannot read config changes: {err}");
+                    return PostAction::Remove;
+                }
+            }
+        }
+        if changed {
+            println!("hyprhopd: config changed, reloading");
+            self.reload_config();
+        }
+        PostAction::Continue
     }
 
     /// Reads whatever the event socket has and reacts to complete lines.
@@ -332,10 +468,13 @@ impl State {
     fn hyprland_event(&mut self, event: &str, data: &str) {
         match event {
             // A reload wipes every bind added at runtime, including hyprhopd's submap.
-            "configreloaded" => self.install_submap(),
+            "configreloaded" => {
+                let warnings = self.install_submap();
+                self.report(&warnings);
+            }
             // The submap changed without hyprhopd (another reset, a reload): leave the mode
             // so no button stays pressed and no timer keeps running.
-            "submap" if self.mode.is_some() && Some(data) != self.submap.as_deref() => {
+            "submap" if self.mode.as_ref().is_some_and(|mode| mode.submap != data) => {
                 self.exit_mode();
             }
             _ => {}
@@ -358,15 +497,18 @@ impl State {
         if self.mode.is_some() {
             return;
         }
-        let Some(submap) = &self.submap else {
+        let Some(submap) = self.submap.clone() else {
             eprintln!("hyprhopd: normal mode is unavailable, its submap isn't installed");
             return;
         };
-        if let Err(err) = hyprland::enter_submap(submap) {
+        if let Err(err) = hyprland::enter_submap(&submap) {
             eprintln!("hyprhopd: cannot enter submap {submap}: {err}");
             return;
         }
         self.mode = Some(ActiveMode {
+            submap,
+            speed: self.config.normal.speed,
+            scroll_speed: self.config.normal.scroll_speed,
             held: HeldKeys::default(),
             held_since: None,
             scroll: ScrollKeys::default(),
@@ -397,7 +539,7 @@ impl State {
             self.virtual_pointer.frame();
         }
         // The exit key already left the submap; this covers every other way of leaving.
-        if hyprland::current_submap().is_ok_and(|name| Some(name) == self.submap)
+        if hyprland::current_submap().is_ok_and(|name| name == mode.submap)
             && let Err(err) = hyprland::reset_submap()
         {
             eprintln!("hyprhopd: cannot leave the submap: {err}");
@@ -515,7 +657,7 @@ impl State {
         mode.last_tick = now;
 
         if let Some(held_since) = mode.held_since {
-            let speed = SPEED.after(now - held_since);
+            let speed = mode.speed.after(now - held_since);
             let (dx, dy) = mode.held.displacement(speed, elapsed);
             if dx != 0.0 || dy != 0.0 {
                 self.virtual_pointer.motion(timestamp, dx, dy);
@@ -524,7 +666,7 @@ impl State {
         }
 
         if let Some(scroll_since) = mode.scroll_since {
-            let speed = SCROLL_SPEED.after(now - scroll_since);
+            let speed = mode.scroll_speed.after(now - scroll_since);
             let amount = mode.scroll.delta(speed, elapsed);
             if amount != 0.0 {
                 // Continuous: smooth values, without the momentum apps add to touchpads.

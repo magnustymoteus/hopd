@@ -80,34 +80,65 @@ fn lua_string(value: &str) -> String {
     out
 }
 
-/// Lua that defines submap `name`: each key in `binds` triggers the global shortcut
-/// `app_id:shortcut`, `exit_key` leaves the submap and triggers `app_id:exit_shortcut`, and
-/// every other key is swallowed.
-pub fn submap_lua(
-    name: &str,
-    app_id: &str,
-    binds: &[(&str, &str)],
-    exit_key: &str,
-    exit_shortcut: &str,
-) -> String {
-    let global = |shortcut: &str| lua_string(&format!("{app_id}:{shortcut}"));
-    let mut lua = format!("hl.define_submap({}, function()\n", lua_string(name));
-    for (key, shortcut) in binds {
-        lua.push_str(&format!(
+/// Shows an on-screen Hyprland notification with a warning icon for `duration_ms`.
+pub fn notify(message: &str, duration_ms: u32) -> Result<(), String> {
+    // Arguments: icon (0 = warning), duration, color (0 = default), message.
+    expect_ok(&format!("notify 0 {duration_ms} 0 {message}"))
+}
+
+/// A Hyprland key string like `SHIFT + CTRL + h`.
+pub fn key_string(mods: &[String], key: &str) -> String {
+    let mut parts: Vec<&str> = mods.iter().map(String::as_str).collect();
+    parts.push(key);
+    parts.join(" + ")
+}
+
+/// Lua that adds `body`'s binds to submap `name`. Defining a submap that already exists
+/// appends to it, so binds can be added one call at a time.
+fn in_submap(name: &str, body: &str) -> String {
+    format!(
+        "hl.define_submap({}, function()\n{body}end)\n",
+        lua_string(name)
+    )
+}
+
+/// Lua that binds `key` in submap `name` to the global shortcut `app_id:shortcut`.
+pub fn bind_lua(name: &str, key: &str, app_id: &str, shortcut: &str) -> String {
+    in_submap(
+        name,
+        &format!(
             "  hl.bind({}, hl.dsp.global({}))\n",
             lua_string(key),
-            global(shortcut)
-        ));
-    }
-    // The exit key resets the submap itself, so it still works if hyprhopd has crashed.
-    lua.push_str(&format!(
-        "  hl.bind({}, function()\n    hl.dispatch(hl.dsp.submap(\"reset\"))\n    hl.dispatch(hl.dsp.global({}))\n  end)\n",
-        lua_string(exit_key),
-        global(exit_shortcut)
-    ));
-    // Catch-all also fires for bound keys, so it must do nothing.
-    lua.push_str("  hl.bind(\"catchall\", function() end)\nend)\n");
-    lua
+            lua_string(&format!("{app_id}:{shortcut}"))
+        ),
+    )
+}
+
+/// Like `bind_lua`, but `key` also leaves the submap. It does that itself, so it still
+/// works if hyprhopd has crashed.
+pub fn exit_bind_lua(name: &str, key: &str, app_id: &str, shortcut: &str) -> String {
+    in_submap(
+        name,
+        &format!(
+            "  hl.bind({}, function()\n    hl.dispatch(hl.dsp.submap(\"reset\"))\n    hl.dispatch(hl.dsp.global({}))\n  end)\n",
+            lua_string(key),
+            lua_string(&format!("{app_id}:{shortcut}"))
+        ),
+    )
+}
+
+/// Lua that swallows every key submap `name` doesn't bind. Catch-all also fires for bound
+/// keys, so it must do nothing.
+pub fn catchall_lua(name: &str) -> String {
+    in_submap(name, "  hl.bind(\"catchall\", function() end)\n")
+}
+
+/// The useful part of Hyprland's reply to a failed bind, like
+/// `failed to parse key string: Unknown keysym: "x"`.
+pub fn bind_error(reply: &str) -> &str {
+    reply
+        .split_once("hl.bind: ")
+        .map_or(reply, |(_, message)| message)
 }
 
 #[cfg(test)]
@@ -121,24 +152,46 @@ mod tests {
     }
 
     #[test]
-    fn submap_binds_each_key_then_exit_then_catchall() {
-        let lua = submap_lua(
-            "hyprhopd-1",
-            "hyprhopd",
-            &[("h", "left"), ("comma", "button_middle")],
-            "escape",
-            "exit",
+    fn binds_are_added_to_the_submap() {
+        assert_eq!(
+            bind_lua("hyprhopd-1", "SHIFT + h", "hyprhopd", "left"),
+            "hl.define_submap(\"hyprhopd-1\", function()\n\
+             \x20 hl.bind(\"SHIFT + h\", hl.dsp.global(\"hyprhopd:left\"))\n\
+             end)\n"
         );
-        let expected = "hl.define_submap(\"hyprhopd-1\", function()\n\
-             \x20 hl.bind(\"h\", hl.dsp.global(\"hyprhopd:left\"))\n\
-             \x20 hl.bind(\"comma\", hl.dsp.global(\"hyprhopd:button_middle\"))\n\
+    }
+
+    #[test]
+    fn the_exit_bind_resets_the_submap_before_notifying() {
+        assert_eq!(
+            exit_bind_lua("hyprhopd-1", "escape", "hyprhopd", "exit"),
+            "hl.define_submap(\"hyprhopd-1\", function()\n\
              \x20 hl.bind(\"escape\", function()\n\
              \x20   hl.dispatch(hl.dsp.submap(\"reset\"))\n\
              \x20   hl.dispatch(hl.dsp.global(\"hyprhopd:exit\"))\n\
              \x20 end)\n\
-             \x20 hl.bind(\"catchall\", function() end)\n\
-             end)\n";
-        assert_eq!(lua, expected);
+             end)\n"
+        );
+    }
+
+    #[test]
+    fn key_strings_join_mods_and_key() {
+        assert_eq!(key_string(&[], "h"), "h");
+        assert_eq!(
+            key_string(&["SHIFT".into(), "CTRL".into()], "comma"),
+            "SHIFT + CTRL + comma"
+        );
+    }
+
+    #[test]
+    fn bind_errors_drop_the_lua_location() {
+        assert_eq!(
+            bind_error(
+                "error: =[C]:-1: hl.bind: failed to parse key string: Unknown keysym: \"x\""
+            ),
+            "failed to parse key string: Unknown keysym: \"x\""
+        );
+        assert_eq!(bind_error("something else"), "something else");
     }
 
     #[test]
