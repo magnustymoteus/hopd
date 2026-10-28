@@ -21,9 +21,26 @@ Control the pointer from the keyboard on [Hyprland](https://hypr.land), in the s
 
 - Hyprland with a Lua config (`hyprland.lua`). hyprhopd installs its keys through
   Hyprland's Lua API. Tested on Hyprland 0.56.2.
-- Rust 1.89 or newer, to build it.
+- libxkbcommon, which every Hyprland system already has.
+- Rust 1.89 or newer, to build it from source.
 
 ## Install
+
+### Prebuilt binary
+
+[Releases](https://github.com/magnustymoteus/hyprhopd/releases) have archives for
+x86_64 and aarch64 (glibc 2.35 or newer). Each one holds the `hyprhopd` binary, this
+README, the license and the example config. To check and install one:
+
+```sh
+sha256sum -c hyprhopd-v0.1.0-x86_64-linux.tar.gz.sha256
+tar -xzf hyprhopd-v0.1.0-x86_64-linux.tar.gz
+install -Dm755 hyprhopd-v0.1.0-x86_64-linux/hyprhopd ~/.local/bin/hyprhopd
+```
+
+Make sure `~/.local/bin` is on the `PATH` Hyprland starts programs with.
+
+### From source
 
 ```sh
 cargo install --git https://github.com/magnustymoteus/hyprhopd
@@ -31,6 +48,8 @@ cargo install --git https://github.com/magnustymoteus/hyprhopd
 
 This puts `hyprhopd` in `~/.cargo/bin`. Make sure that directory is on the `PATH`
 Hyprland starts programs with. From a clone, `cargo install --path .` does the same.
+
+### Starting it
 
 Then, in `~/.config/hypr/hyprland.lua`, start hyprhopd with Hyprland and bind the two modes:
 
