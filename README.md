@@ -11,6 +11,8 @@ Control the pointer from the keyboard on [Hyprland](https://hypr.land), in the s
   them. Click, drag and scroll from the keyboard. Scrolling is smooth, not in wheel notches.
 - **Pane mode**: labels appear over the focused window. Type one to jump the pointer
   there, then fine-tune and click in normal mode.
+- **Window mode**: a label on every window you can see, on every monitor. Type one to
+  focus that window.
 - **Its own config file**: binds, speeds, label styling and fades all live in
   `hyprhopd.conf`, in Hyprland's config syntax. Saving the file applies it, with no
   restart needed.
@@ -51,7 +53,7 @@ Hyprland starts programs with. From a clone, `cargo install --path .` does the s
 
 ### Starting it
 
-Then, in `~/.config/hypr/hyprland.lua`, start hyprhopd with Hyprland and bind the two modes:
+Then, in `~/.config/hypr/hyprland.lua`, start hyprhopd with Hyprland and bind its modes:
 
 ```lua
 hl.on("hyprland.start", function()
@@ -60,10 +62,12 @@ end)
 
 hl.bind("SUPER + semicolon", hl.dsp.global("hyprhopd:normal"))
 hl.bind("SUPER + SHIFT + semicolon", hl.dsp.global("hyprhopd:pane"))
+hl.bind("SUPER + apostrophe", hl.dsp.global("hyprhopd:window"))
 ```
 
-Any key combination works. hyprhopd registers `hyprhopd:normal` and `hyprhopd:pane` as
-global shortcuts, and `hyprctl globalshortcuts` lists them once it's running.
+Any key combination works. hyprhopd registers `hyprhopd:normal`, `hyprhopd:pane` and
+`hyprhopd:window` as global shortcuts, and `hyprctl globalshortcuts` lists them once it's
+running.
 
 Run only one hyprhopd at a time: every running copy reacts to the shortcuts.
 
@@ -92,6 +96,20 @@ rebound, see [Binds](#binds).
 
 `Escape` cancels without moving. Pane mode also cancels if its window closes, moves to
 another workspace, or changes fullscreen or floating state.
+
+### Window mode
+
+1. A label appears at the centre of every window you can see, on every monitor. Typing and
+   `Backspace` work as in pane mode.
+2. When a label is complete, that window gets the focus and the pointer moves to its
+   centre.
+
+Windows you can see are those on each monitor's current workspace. If a special workspace
+is open on a monitor, only its windows get labels there; if a window is fullscreen or
+maximized, only that one does. Background tabs of a group get none.
+
+`Escape` cancels. Window mode also cancels if any window opens, closes, moves or changes
+fullscreen or floating state, or if a workspace or monitor changes.
 
 ## Configuration
 
@@ -138,7 +156,7 @@ normal {
 | `button_right` | `period` |
 | `exit` | `escape` |
 
-Pane mode's `Escape` and `Backspace` are fixed for now.
+Pane and window mode's `Escape` and `Backspace` are fixed for now.
 
 ### Normal mode options
 
@@ -181,6 +199,25 @@ normal {
 
 Labels all have the same length: the shortest that gives every point its own label.
 
+### Window mode options
+
+Window mode looks like pane mode: every option you don't set in a `window` section comes
+from `pane`, defaults included. The `window` section takes the same options as `pane`,
+except `spacing`: `window:chars`, `window:font:size`, `window:label:radius`,
+`window:backdrop:color` and so on. Set only what should differ. For example, bigger labels
+for bigger targets:
+
+```
+window {
+    font {
+        size = 20
+    }
+}
+```
+
+An invalid `window` value is skipped with a warning and keeps pane mode's value. The
+backdrop dims every labelled window.
+
 ### Animations
 
 | Option | Default | Meaning |
@@ -190,9 +227,16 @@ Labels all have the same length: the shortest that gives every point its own lab
 | `animations:pane_in:curve` | `ease_out` | `linear`, `ease_out`, or a defined bezier |
 | `animations:pane_out:duration` | `0` | Fade-out, in ms |
 | `animations:pane_out:curve` | `ease_out` | As above |
+| `animations:window_in:duration` | `pane_in`'s | Window mode fade-in, in ms |
+| `animations:window_in:curve` | `pane_in`'s | As above |
+| `animations:window_out:duration` | `pane_out`'s | Window mode fade-out, in ms |
+| `animations:window_out:curve` | `pane_out`'s | As above |
 
-hyprhopd turns off Hyprland's own layer animations for its overlay, so these are the only
-fades. Picking a label jumps right away; the labels fade out afterwards.
+Each `window_in` / `window_out` field you don't set comes from the matching `pane_in` /
+`pane_out` field, so window mode fades like pane mode unless you say otherwise.
+
+hyprhopd turns off Hyprland's own layer animations for its overlays, so these are the only
+fades. Picking a label jumps or focuses right away; the labels fade out afterwards.
 
 ### Colours
 

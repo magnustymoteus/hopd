@@ -56,6 +56,12 @@ pub fn current_submap() -> Result<String, String> {
     request("submap").map_err(|err| err.to_string())
 }
 
+/// Focuses the window with `address`, written like `0x5617571353a0`.
+pub fn focus_window(address: &str) -> Result<(), String> {
+    let window = lua_string(&format!("address:{address}"));
+    expect_ok(&format!("dispatch hl.dsp.focus({{ window = {window} }})"))
+}
+
 /// A window as `hyprctl activewindow -j` describes it, in layout coordinates.
 #[derive(Debug, Deserialize)]
 pub struct Window {
@@ -74,11 +80,41 @@ impl Window {
     }
 }
 
+/// A window as `hyprctl clients -j` describes it, in layout coordinates.
+#[derive(Debug, Deserialize)]
+pub struct Client {
+    /// Like `0x5617571353a0`.
+    pub address: String,
+    pub at: [i32; 2],
+    pub size: [i32; 2],
+    pub workspace: WorkspaceRef,
+    /// False while the window is being created or destroyed.
+    pub mapped: bool,
+    /// True for the windows of a group that aren't its current tab.
+    pub hidden: bool,
+    /// 0 when not fullscreen; 1 when maximized, 2 when fullscreen.
+    pub fullscreen: i64,
+}
+
+/// A workspace, as monitors and windows refer to it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct WorkspaceRef {
+    /// Special workspaces have negative ids; 0 means none.
+    pub id: i64,
+}
+
 /// A monitor as `hyprctl monitors -j` describes it.
 #[derive(Debug, Deserialize)]
 pub struct Monitor {
     pub id: i64,
     pub name: String,
+    /// Whether it has the keyboard focus.
+    pub focused: bool,
+    #[serde(rename = "activeWorkspace")]
+    pub active_workspace: WorkspaceRef,
+    /// The special workspace open on it; id 0 if none is.
+    #[serde(rename = "specialWorkspace")]
+    pub special_workspace: WorkspaceRef,
     /// Top-left corner in layout coordinates.
     pub x: i32,
     pub y: i32,
@@ -120,6 +156,27 @@ pub fn active_window() -> Result<Option<Window>, String> {
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     let reply = request("j/monitors").map_err(|err| err.to_string())?;
     serde_json::from_str(&reply).map_err(|err| format!("unexpected monitors reply: {err}"))
+}
+
+/// Every window, on every workspace.
+pub fn clients() -> Result<Vec<Client>, String> {
+    let reply = request("j/clients").map_err(|err| err.to_string())?;
+    serde_json::from_str(&reply).map_err(|err| format!("unexpected clients reply: {err}"))
+}
+
+/// Top-left corner and size of the box around every monitor, in layout coordinates.
+/// Absolute pointer motion is relative to this box.
+pub fn layout_bounds(monitors: &[Monitor]) -> (f64, f64, f64, f64) {
+    let boxes = monitors.iter().map(|monitor| {
+        let (width, height) = monitor.logical_size();
+        let (x, y) = (f64::from(monitor.x), f64::from(monitor.y));
+        (x, y, x + width, y + height)
+    });
+    let (left, top, right, bottom) = boxes.fold(
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+        |(l, t, r, b), (x0, y0, x1, y1)| (l.min(x0), t.min(y0), r.max(x1), b.max(y1)),
+    );
+    (left, top, right - left, bottom - top)
 }
 
 /// Hyprland's `decoration:rounding`: the radius of window corners, in pixels.
@@ -232,8 +289,59 @@ pub fn bind_error(reply: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    /// A monitor showing workspace 1, with no special workspace open.
+    pub fn monitor(
+        id: i64,
+        at: (i32, i32),
+        size: (i32, i32),
+        scale: f64,
+        transform: i32,
+    ) -> Monitor {
+        Monitor {
+            id,
+            name: String::new(),
+            focused: false,
+            active_workspace: WorkspaceRef { id: 1 },
+            special_workspace: WorkspaceRef { id: 0 },
+            x: at.0,
+            y: at.1,
+            width: size.0,
+            height: size.1,
+            scale,
+            transform,
+        }
+    }
+
+    #[test]
+    fn layout_covers_every_monitor_in_logical_pixels() {
+        let monitors = [
+            monitor(0, (0, 0), (1920, 1080), 1.0, 0),
+            // A 4K monitor at scale 2, to the right: 1920x1080 logical.
+            monitor(1, (1920, -200), (3840, 2160), 2.0, 0),
+        ];
+        assert_eq!(layout_bounds(&monitors), (0.0, -200.0, 3840.0, 1280.0));
+    }
+
+    #[test]
+    fn rotated_monitors_swap_width_and_height() {
+        let monitors = [monitor(0, (0, 0), (1920, 1080), 1.0, 1)];
+        assert_eq!(layout_bounds(&monitors), (0.0, 0.0, 1080.0, 1920.0));
+    }
+
+    #[test]
+    fn clients_parse_from_hyprctl_json() {
+        let reply = r#"[{"address": "0x55c4ecce2d70", "mapped": true, "hidden": false,
+            "visible": true, "at": [12, 44], "size": [1896, 1024],
+            "workspace": {"id": 4, "name": "4"}, "floating": false, "monitor": 0,
+            "class": "kitty", "fullscreen": 0}]"#;
+        let clients: Vec<Client> = serde_json::from_str(reply).unwrap();
+        assert_eq!(clients[0].address, "0x55c4ecce2d70");
+        assert_eq!(clients[0].workspace.id, 4);
+        assert_eq!(clients[0].size, [1896, 1024]);
+    }
 
     #[test]
     fn lua_strings_are_escaped() {

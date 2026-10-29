@@ -1,17 +1,19 @@
 //! A layer surface that can fade in and out. Instead of redrawing, hyprhopd asks Hyprland
 //! to scale the surface's opacity (wp_alpha_modifier_v1), once per frame callback.
+//! Pane and window mode both draw their labels on these.
 
 use std::time::Instant;
 
+use log::{info, warn};
 use smithay_client_toolkit::{
-    compositor::FrameCallbackData,
+    compositor::{FrameCallbackData, Region},
     reexports::protocols::wp::alpha_modifier::v1::client::{
         wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
         wp_alpha_modifier_v1::WpAlphaModifierV1,
     },
     shell::{
         WaylandSurface,
-        wlr_layer::{KeyboardInteractivity, LayerSurface},
+        wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
     },
     shm::slot::Buffer,
 };
@@ -20,6 +22,9 @@ use wayland_client::{QueueHandle, protocol::wl_surface::WlSurface};
 use crate::State;
 use crate::config::Animation;
 use crate::handlers::AlphaModifierData;
+
+/// The layer-shell namespace, which Hyprland layer rules can match on.
+pub const LAYER_NAMESPACE: &str = "hyprhopd";
 
 struct Fade {
     animation: Animation,
@@ -164,6 +169,110 @@ impl Overlay {
             alpha.set_multiplier((opacity * f64::from(u32::MAX)) as u32);
         }
         self.opacity = opacity;
+    }
+}
+
+impl State {
+    /// A layer surface covering the monitor named `monitor`, above everything and
+    /// click-through. With `keyboard`, it takes the keyboard while it exists. Nothing is
+    /// drawn until Hyprland's configure arrives.
+    pub fn overlay_layer(
+        &self,
+        monitor: &str,
+        keyboard: bool,
+        qh: &QueueHandle<State>,
+    ) -> Option<LayerSurface> {
+        // Wayland names outputs the way Hyprland names monitors, like eDP-1.
+        let Some(output) = self.output_state.outputs().find(|output| {
+            self.output_state
+                .info(output)
+                .and_then(|info| info.name)
+                .is_some_and(|name| name == monitor)
+        }) else {
+            warn!("no Wayland output for monitor {monitor}");
+            return None;
+        };
+        let surface = self.compositor.create_surface(qh);
+        // An empty input region lets the pointer pass through to the windows.
+        match Region::new(&self.compositor) {
+            Ok(region) => surface.set_input_region(Some(region.wl_region())),
+            Err(err) => warn!("cannot make the overlay click-through: {err}"),
+        }
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some(LAYER_NAMESPACE),
+            Some(&output),
+        );
+        // Anchored to every edge with size 0: Hyprland sizes it to the whole monitor, and
+        // -1 keeps bars' reserved space from shrinking it.
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_size(0, 0);
+        layer.set_keyboard_interactivity(if keyboard {
+            KeyboardInteractivity::Exclusive
+        } else {
+            KeyboardInteractivity::None
+        });
+        // The first commit carries no buffer; drawing waits for Hyprland's configure.
+        layer.commit();
+        Some(layer)
+    }
+
+    /// Fades an overlay out if `animation` asks for it, otherwise removes it at once.
+    pub fn retire(&mut self, mut overlay: Overlay, animation: Animation) {
+        if overlay.fade_out(animation, &self.qh) {
+            self.fading_out.push(overlay);
+        }
+    }
+
+    /// Hyprland told one of hyprhopd's overlays its size.
+    pub fn overlay_configured(&mut self, layer: &LayerSurface, size: (u32, u32)) {
+        if self.owns_pane_layer(layer) {
+            self.pane_configured(size);
+        } else {
+            self.window_configured(layer, size);
+        }
+    }
+
+    /// A frame callback for one of hyprhopd's overlays: time for the next fade step.
+    pub fn overlay_frame(&mut self, surface: &WlSurface) {
+        // A cheap handle, cloned because the overlay borrows all of `self`.
+        let qh = self.qh.clone();
+        if let Some(overlay) = self.mode_overlay_mut(surface) {
+            overlay.frame(&qh);
+            return;
+        }
+        // Once its fade has finished, a retired overlay is dropped, which removes it.
+        self.fading_out
+            .retain_mut(|overlay| overlay.surface() != surface || overlay.frame(&qh));
+    }
+
+    /// Hyprland removed an overlay, for example because its monitor went away. Its mode
+    /// ends at once: there's nothing left to fade.
+    pub fn overlay_closed(&mut self, layer: &LayerSurface) {
+        if self.owns_pane_layer(layer) {
+            self.pane = None;
+            info!("pane mode off");
+        } else if self.owns_window_layer(layer) {
+            self.window = None;
+            info!("window mode off");
+        } else {
+            self.fading_out.retain(|overlay| &overlay.layer != layer);
+        }
+    }
+
+    /// The overlay of the active pane or window mode that `surface` belongs to.
+    fn mode_overlay_mut(&mut self, surface: &WlSurface) -> Option<&mut Overlay> {
+        if let Some(pane) = self.pane.as_mut()
+            && pane.overlay.surface() == surface
+        {
+            return Some(&mut pane.overlay);
+        }
+        self.window
+            .as_mut()
+            .and_then(|window| window.overlay_mut(surface))
     }
 }
 

@@ -1,14 +1,14 @@
-//! Draws pane mode's labels into a shared-memory buffer: tiny-skia for shapes (label
+//! Draws hint labels into a shared-memory buffer: tiny-skia for shapes (label
 //! boxes, borders, the backdrop), cosmic-text for finding fonts and turning text into glyph
 //! pixels.
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use tiny_skia::{FillRule, Paint, Path, PathBuilder, PixmapMut, Rect, Stroke, Transform};
 
-use crate::config::{PaneConfig, Rgba};
+use crate::config::{HintStyle, Rgba};
 use crate::hints::Hints;
 
-/// The target window's place on the canvas.
+/// A labelled window's place on the canvas.
 #[derive(Debug, Clone, Copy)]
 pub struct Area {
     pub x: f32,
@@ -41,38 +41,44 @@ impl Renderer {
         })
     }
 
-    /// Draws the backdrop and the visible hints onto a transparent `width` × `height`
-    /// canvas in Wayland's ARGB8888 format. Hint positions are relative to `window`.
+    /// Draws a backdrop behind each of `windows` and the visible hints onto a transparent
+    /// `width` × `height` canvas in Wayland's ARGB8888 format. A hint at (x, y) lands at
+    /// `origin` + (x, y) on the canvas; hints whose point is off the canvas are skipped.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         canvas: &mut [u8],
         width: u32,
         height: u32,
-        window: Area,
+        windows: &[Area],
+        origin: (f32, f32),
         hints: &Hints,
-        style: &PaneConfig,
+        style: &HintStyle,
     ) {
         canvas.fill(0);
         let Some(mut pixmap) = PixmapMut::from_bytes(canvas, width, height) else {
             return;
         };
 
-        if style.backdrop.a > 0
-            && let Some(path) = rounded_rect(
-                window.x,
-                window.y,
-                window.width,
-                window.height,
-                window.radius,
-            )
-        {
-            pixmap.fill_path(
-                &path,
-                &paint(style.backdrop),
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+        if style.backdrop.a > 0 {
+            let backdrop = paint(style.backdrop);
+            for window in windows {
+                if let Some(path) = rounded_rect(
+                    window.x,
+                    window.y,
+                    window.width,
+                    window.height,
+                    window.radius,
+                ) {
+                    pixmap.fill_path(
+                        &path,
+                        &backdrop,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
         }
 
         let label = &style.label;
@@ -98,6 +104,11 @@ impl Renderer {
 
         let typed: String = hints.typed().iter().collect();
         for hint in hints.visible() {
+            let (x, y) = (origin.0 + hint.x as f32, origin.1 + hint.y as f32);
+            // Another monitor's label, in window mode.
+            if !(0.0..width as f32).contains(&x) || !(0.0..height as f32).contains(&y) {
+                continue;
+            }
             let rest: String = hint.label[typed.chars().count()..].iter().collect();
             let mut text = Buffer::new(&mut self.fonts, metrics);
             text.set_rich_text(
@@ -116,8 +127,8 @@ impl Renderer {
             // The box: text, padding around it, then the border around that.
             let box_width = text_width + 2.0 * (padding_x + border);
             let box_height = text_height + 2.0 * (padding_y + border);
-            let box_left = (window.x + hint.x as f32 - box_width / 2.0).round();
-            let box_top = (window.y + hint.y as f32 - box_height / 2.0).round();
+            let box_left = (x - box_width / 2.0).round();
+            let box_top = (y - box_height / 2.0).round();
             if let Some(path) = rounded_rect(box_left, box_top, box_width, box_height, label.radius)
             {
                 pixmap.fill_path(

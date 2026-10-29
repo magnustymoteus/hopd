@@ -9,6 +9,7 @@ mod overlay;
 mod pane;
 mod protocol;
 mod render;
+mod window;
 
 use std::io::{ErrorKind, Read};
 use std::os::fd::AsFd;
@@ -58,6 +59,7 @@ use pane::PaneMode;
 use protocol::global_shortcuts::hyprland_global_shortcut_v1::HyprlandGlobalShortcutV1;
 use protocol::global_shortcuts::hyprland_global_shortcuts_manager_v1::HyprlandGlobalShortcutsManagerV1;
 use render::Renderer;
+use window::WindowMode;
 
 /// The app_id Hyprland binds refer to, as in `hyprhopd:normal`.
 const APP_ID: &str = "hyprhopd";
@@ -89,12 +91,13 @@ impl MouseButton {
     }
 }
 
-/// Each global shortcut hyprhopd registers with Hyprland. `Normal` and `Pane` are bound by
-/// the user in Hyprland's config; the rest are bound by hyprhopd's own submap.
+/// Each global shortcut hyprhopd registers with Hyprland. `Normal`, `Pane` and `Window`
+/// are bound by the user in Hyprland's config; the rest are bound by hyprhopd's own submap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Normal,
     Pane,
+    Window,
     Exit,
     Move(Direction),
     Scroll(ScrollDirection),
@@ -102,9 +105,10 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Action; 12] = [
+    const ALL: [Action; 13] = [
         Action::Normal,
         Action::Pane,
+        Action::Window,
         Action::Exit,
         Action::Move(Direction::Left),
         Action::Move(Direction::Down),
@@ -121,6 +125,7 @@ impl Action {
         match self {
             Action::Normal => "normal",
             Action::Pane => "pane",
+            Action::Window => "window",
             Action::Exit => "exit",
             Action::Move(Direction::Left) => "left",
             Action::Move(Direction::Down) => "down",
@@ -138,6 +143,7 @@ impl Action {
         match self {
             Action::Normal => "Enter normal mode (keyboard-driven pointer)",
             Action::Pane => "Enter pane mode (hints in the focused pane)",
+            Action::Window => "Enter window mode (jump to a visible window)",
             Action::Exit => "Leave the current hyprhopd mode",
             Action::Move(_) => "Move the pointer (normal mode)",
             Action::Scroll(_) => "Scroll (normal mode)",
@@ -152,7 +158,7 @@ impl Action {
 
     /// Whether the action can be bound inside normal mode.
     fn in_normal_mode(self) -> bool {
-        !matches!(self, Action::Normal | Action::Pane)
+        !matches!(self, Action::Normal | Action::Pane | Action::Window)
     }
 }
 
@@ -185,7 +191,7 @@ pub struct State {
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
-    /// Shared memory pane mode draws its overlay into.
+    /// Shared memory pane and window mode draw their overlays into.
     pool: SlotPool,
     keyboard: Option<WlKeyboard>,
     renderer: Renderer,
@@ -212,8 +218,9 @@ pub struct State {
     config_watch: Option<Inotify>,
     mode: Option<ActiveMode>,
     pane: Option<PaneMode>,
-    /// The last pane overlay, while it fades out after pane mode ended.
-    fading_out: Option<Overlay>,
+    window: Option<WindowMode>,
+    /// Overlays of a pane or window mode that ended, while they fade out.
+    fading_out: Vec<Overlay>,
 }
 
 fn main() -> ExitCode {
@@ -250,7 +257,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shm = Shm::bind(&globals, &qh).map_err(|_| "compositor does not support wl_shm")?;
     let alpha_modifier: Option<WpAlphaModifierV1> =
         globals.bind(&qh, 1..=1, AlphaModifierData).ok();
-    // Grows on demand; pane mode's first buffer sets the real size.
+    // Grows on demand; the first overlay's buffer sets the real size.
     let pool = SlotPool::new(4, &shm)?;
     // No seat given: Hyprland attaches it to the default seat.
     let virtual_pointer = pointer_manager.create_virtual_pointer(None, &qh, VirtualPointerData);
@@ -296,7 +303,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_watch: None,
         mode: None,
         pane: None,
-        fading_out: None,
+        window: None,
+        fading_out: Vec::new(),
     };
 
     // Flush the registrations and surface any protocol error right away.
@@ -340,7 +348,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("cannot add Hyprland events to the event loop: {e}"))?;
 
-    info!("registered {APP_ID}:normal and {APP_ID}:pane, waiting for shortcuts");
+    info!("registered {APP_ID}:normal, {APP_ID}:pane and {APP_ID}:window, waiting for shortcuts");
 
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
@@ -357,17 +365,32 @@ impl State {
         match self.config_path.as_deref().map(config::load) {
             Some(Loaded::Parsed(config, problems)) => {
                 warnings = problems;
-                // cosmic-text silently falls back for unknown fonts, so check here.
-                if let Some(family) = &config.pane.font.family
-                    && !self.renderer.has_family(family)
-                {
-                    warnings.push(format!(
-                        "pane:font:family = {family}: no such font installed, using a fallback"
-                    ));
+                // cosmic-text silently falls back for unknown fonts, so check here. Window
+                // mode's family is only checked if it's its own, so one typo warns once.
+                let pane_family = &config.pane.style.font.family;
+                let window_family = &config.window.style.font.family;
+                let mut families = vec![("pane", pane_family)];
+                if window_family != pane_family {
+                    families.push(("window", window_family));
+                }
+                for (section, family) in families {
+                    if let Some(family) = family
+                        && !self.renderer.has_family(family)
+                    {
+                        warnings.push(format!(
+                            "{section}:font:family = {family}: no such font installed, using a fallback"
+                        ));
+                    }
                 }
                 let animations = &config.animations;
-                let fades = !animations.pane_in.duration.is_zero()
-                    || !animations.pane_out.duration.is_zero();
+                let fades = [
+                    animations.pane_in,
+                    animations.pane_out,
+                    animations.window_in,
+                    animations.window_out,
+                ]
+                .iter()
+                .any(|animation| !animation.duration.is_zero());
                 if fades && self.alpha_modifier.is_none() {
                     warnings.push(
                         "animations: Hyprland lacks wp_alpha_modifier_v1, so fades are skipped"
@@ -397,7 +420,7 @@ impl State {
     /// only fade is the one in hyprhopd.conf. Like the submap, it's added at runtime and
     /// again after each Hyprland reload.
     fn disable_layer_animation(&self) {
-        let lua = hyprland::no_anim_layer_rule_lua("hyprhopd-no-anim", pane::LAYER_NAMESPACE);
+        let lua = hyprland::no_anim_layer_rule_lua("hyprhopd-no-anim", overlay::LAYER_NAMESPACE);
         if let Err(err) = hyprland::eval(&lua) {
             warn!("cannot turn off Hyprland's overlay animation: {err}");
         }
@@ -566,6 +589,7 @@ impl State {
                 self.exit_mode();
             }
             _ if self.pane.is_some() => self.pane_hyprland_event(event, data),
+            _ if self.window.is_some() => self.window_hyprland_event(event),
             _ => {}
         }
     }
@@ -574,6 +598,7 @@ impl State {
         match (action, pressed) {
             (Action::Normal, true) => self.enter_normal_mode(),
             (Action::Pane, true) => self.enter_pane_mode(qh),
+            (Action::Window, true) => self.enter_window_mode(qh),
             (Action::Exit, true) => self.exit_mode(),
             (Action::Move(direction), _) => self.set_moving(direction, pressed),
             (Action::Scroll(direction), _) => self.set_scrolling(direction, pressed),
@@ -582,8 +607,13 @@ impl State {
         }
     }
 
+    /// Whether one of hyprhopd's modes is active; only one can be at a time.
+    fn busy(&self) -> bool {
+        self.mode.is_some() || self.pane.is_some() || self.window.is_some()
+    }
+
     fn enter_normal_mode(&mut self) {
-        if self.mode.is_some() || self.pane.is_some() {
+        if self.busy() {
             return;
         }
         let Some(submap) = self.submap.clone() else {
@@ -686,6 +716,19 @@ impl State {
             }
             _ => {}
         }
+    }
+
+    /// Moves the pointer straight to `(x, y)` in layout coordinates. `layout` is the box
+    /// around every monitor, which absolute motion is relative to.
+    fn jump_pointer(&self, x: f64, y: f64, (left, top, width, height): (f64, f64, f64, f64)) {
+        self.virtual_pointer.motion_absolute(
+            self.timestamp(),
+            (x - left).round() as u32,
+            (y - top).round() as u32,
+            width.round() as u32,
+            height.round() as u32,
+        );
+        self.virtual_pointer.frame();
     }
 
     fn send_button(&self, timestamp: u32, button: MouseButton, state: ButtonState) {

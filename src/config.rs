@@ -13,6 +13,12 @@
 //!         padding = 1 4
 //!     }
 //! }
+//! window {
+//!     # Anything not set here comes from pane { }.
+//!     font {
+//!         size = 20
+//!     }
+//! }
 //! animations {
 //!     bezier = quick, 0.15, 0, 0.1, 1
 //!     pane_in {
@@ -64,28 +70,26 @@ const DEFAULT_SCROLL_SPEED: Speed = Speed {
 /// Options hyprhopd understands, besides `normal:bind`.
 const SPEED_OPTIONS: [&str; 2] = ["speed", "scroll_speed"];
 const SPEED_FIELDS: [&str; 3] = ["initial", "acceleration", "max"];
-const PANE_OPTIONS: [&str; 13] = [
-    "pane:spacing",
-    "pane:chars",
-    "pane:font:family",
-    "pane:font:size",
-    "pane:font:weight",
-    "pane:label:text_color",
-    "pane:label:typed_color",
-    "pane:label:background",
-    "pane:label:padding",
-    "pane:label:radius",
-    "pane:label:border:width",
-    "pane:label:border:color",
-    "pane:backdrop:color",
+/// Sections whose labels look like `HintStyle` says.
+const HINT_SECTIONS: [&str; 2] = ["pane", "window"];
+/// `HintStyle`'s options, inside each of those sections.
+const STYLE_OPTIONS: [&str; 12] = [
+    "chars",
+    "font:family",
+    "font:size",
+    "font:weight",
+    "label:text_color",
+    "label:typed_color",
+    "label:background",
+    "label:padding",
+    "label:radius",
+    "label:border:width",
+    "label:border:color",
+    "backdrop:color",
 ];
 
-const ANIMATION_OPTIONS: [&str; 4] = [
-    "animations:pane_in:duration",
-    "animations:pane_in:curve",
-    "animations:pane_out:duration",
-    "animations:pane_out:curve",
-];
+const ANIMATIONS: [&str; 4] = ["pane_in", "pane_out", "window_in", "window_out"];
+const ANIMATION_FIELDS: [&str; 2] = ["duration", "curve"];
 
 /// Curves every config can use without defining them.
 const BUILT_IN_CURVES: [(&str, Curve); 2] =
@@ -190,22 +194,20 @@ pub struct LabelStyle {
     pub border_color: Rgba,
 }
 
+/// What a mode's labels are made of and look like. Pane and window mode each have one.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PaneConfig {
-    /// Distance between neighbouring label centres, in pixels.
-    pub spacing: f64,
+pub struct HintStyle {
     /// Characters labels are made of, in the order labels use them.
     pub chars: Vec<char>,
     pub font: Font,
     pub label: LabelStyle,
-    /// Dims the target window behind the labels; transparent means off.
+    /// Dims the labelled windows behind the labels; transparent means off.
     pub backdrop: Rgba,
 }
 
-impl Default for PaneConfig {
-    fn default() -> PaneConfig {
-        PaneConfig {
-            spacing: 60.0,
+impl Default for HintStyle {
+    fn default() -> HintStyle {
+        HintStyle {
             chars: ('a'..='z').collect(),
             font: Font {
                 family: None,
@@ -224,6 +226,28 @@ impl Default for PaneConfig {
             backdrop: Rgba::hex(0x00000000),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneConfig {
+    /// Distance between neighbouring label centres, in pixels.
+    pub spacing: f64,
+    pub style: HintStyle,
+}
+
+impl Default for PaneConfig {
+    fn default() -> PaneConfig {
+        PaneConfig {
+            spacing: 60.0,
+            style: HintStyle::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WindowConfig {
+    /// Starts out as pane mode's style; `window { }` overrides parts of it.
+    pub style: HintStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -248,12 +272,17 @@ pub struct Animations {
     pub pane_in: Animation,
     /// Pane mode's labels fading out.
     pub pane_out: Animation,
+    /// Window mode's labels fading in; each field not set falls back to `pane_in`'s.
+    pub window_in: Animation,
+    /// Window mode's labels fading out; each field not set falls back to `pane_out`'s.
+    pub window_out: Animation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub normal: NormalConfig,
     pub pane: PaneConfig,
+    pub window: WindowConfig,
     pub animations: Animations,
 }
 
@@ -269,6 +298,7 @@ impl Default for Config {
                 scroll_speed: DEFAULT_SCROLL_SPEED,
             },
             pane: PaneConfig::default(),
+            window: WindowConfig::default(),
             animations: Animations::default(),
         }
     }
@@ -356,6 +386,10 @@ fn parse_with(run: impl FnOnce(&mut hyprlang::Config) -> ParseResult<()>) -> Loa
     config.normal.scroll_speed =
         read_speed(&parser, "scroll_speed", DEFAULT_SCROLL_SPEED, &mut warnings);
     config.pane = read_pane(&parser, &mut warnings);
+    // Window mode looks like pane mode, except for what `window { }` sets.
+    config.window = WindowConfig {
+        style: read_style(&parser, "window", &config.pane.style, &mut warnings),
+    };
     config.animations = read_animations(&parser, &mut warnings);
 
     let mut unknown: Vec<&str> = parser
@@ -440,7 +474,10 @@ fn read_speed(
 }
 
 fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfig {
-    let mut pane = PaneConfig::default();
+    let mut pane = PaneConfig {
+        style: read_style(parser, "pane", &HintStyle::default(), warnings),
+        ..PaneConfig::default()
+    };
     if let Some(spacing) = number(parser, "pane:spacing", warnings) {
         // Below this, a window would need thousands of labels.
         if spacing >= MIN_SPACING {
@@ -451,44 +488,60 @@ fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfi
             ));
         }
     }
-    if let Some(chars) = text(parser, "pane:chars", warnings) {
+    pane
+}
+
+/// Reads the label options inside `section`, like `pane:label:radius`. Options that
+/// aren't set, or are invalid, keep their value from `base`.
+fn read_style(
+    parser: &hyprlang::Config,
+    section: &str,
+    base: &HintStyle,
+    warnings: &mut Vec<String>,
+) -> HintStyle {
+    let key = |option: &str| format!("{section}:{option}");
+    let mut style = base.clone();
+    if let Some(chars) = text(parser, &key("chars"), warnings) {
         match parse_chars(&chars) {
-            Ok(chars) => pane.chars = chars,
-            Err(reason) => warnings.push(format!("pane:chars = {chars}: {reason}")),
+            Ok(chars) => style.chars = chars,
+            Err(reason) => warnings.push(format!("{} = {chars}: {reason}", key("chars"))),
         }
     }
-    if let Some(family) = text(parser, "pane:font:family", warnings) {
-        pane.font.family = Some(family);
+    if let Some(family) = text(parser, &key("font:family"), warnings) {
+        style.font.family = Some(family);
     }
-    if let Some(size) = number(parser, "pane:font:size", warnings) {
+    if let Some(size) = number(parser, &key("font:size"), warnings) {
         if size > 0.0 {
-            pane.font.size = size as f32;
+            style.font.size = size as f32;
         } else {
-            warnings.push(format!("pane:font:size = {size}: must be positive"));
+            warnings.push(format!("{} = {size}: must be positive", key("font:size")));
         }
     }
-    if let Some(weight) = text(parser, "pane:font:weight", warnings) {
+    if let Some(weight) = text(parser, &key("font:weight"), warnings) {
         match parse_weight(&weight) {
-            Some(weight) => pane.font.weight = weight,
+            Some(weight) => style.font.weight = weight,
             None => warnings.push(format!(
-                "pane:font:weight = {weight}: expected thin, light, normal, medium, bold, black, ... or a number from 1 to 1000"
+                "{} = {weight}: expected thin, light, normal, medium, bold, black, ... or a number from 1 to 1000",
+                key("font:weight")
             )),
         }
     }
-    let label = &mut pane.label;
-    if let Some(padding) = text(parser, "pane:label:padding", warnings) {
+    let label = &mut style.label;
+    if let Some(padding) = text(parser, &key("label:padding"), warnings) {
         match parse_padding(&padding) {
             Some(padding) => label.padding = padding,
             None => warnings.push(format!(
-                "pane:label:padding = {padding}: expected one or two numbers, like 4 or 1 4"
+                "{} = {padding}: expected one or two numbers, like 4 or 1 4",
+                key("label:padding")
             )),
         }
     }
-    for (key, slot) in [
-        ("pane:label:radius", &mut label.radius),
-        ("pane:label:border:width", &mut label.border_width),
+    for (option, slot) in [
+        ("label:radius", &mut label.radius),
+        ("label:border:width", &mut label.border_width),
     ] {
-        if let Some(value) = number(parser, key, warnings) {
+        let key = key(option);
+        if let Some(value) = number(parser, &key, warnings) {
             if value >= 0.0 {
                 *slot = value as f32;
             } else {
@@ -496,18 +549,18 @@ fn read_pane(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> PaneConfi
             }
         }
     }
-    for (key, slot) in [
-        ("pane:label:text_color", &mut label.text_color),
-        ("pane:label:typed_color", &mut label.typed_color),
-        ("pane:label:background", &mut label.background),
-        ("pane:label:border:color", &mut label.border_color),
-        ("pane:backdrop:color", &mut pane.backdrop),
+    for (option, slot) in [
+        ("label:text_color", &mut label.text_color),
+        ("label:typed_color", &mut label.typed_color),
+        ("label:background", &mut label.background),
+        ("label:border:color", &mut label.border_color),
+        ("backdrop:color", &mut style.backdrop),
     ] {
-        if let Some(color) = color(parser, key, warnings) {
+        if let Some(color) = color(parser, &key(option), warnings) {
             *slot = color;
         }
     }
-    pane
+    style
 }
 
 /// CSS-style padding: `4` for every side, or `1 4` for vertical then horizontal.
@@ -541,30 +594,45 @@ fn read_animations(parser: &hyprlang::Config, warnings: &mut Vec<String>) -> Ani
         }
     }
 
-    let mut animations = Animations::default();
-    for (name, animation) in [
-        ("pane_in", &mut animations.pane_in),
-        ("pane_out", &mut animations.pane_out),
-    ] {
-        let key = format!("animations:{name}:duration");
-        if let Some(ms) = number(parser, &key, warnings) {
-            if ms >= 0.0 {
-                animation.duration = Duration::from_secs_f64(ms / 1000.0);
-            } else {
-                warnings.push(format!("{key} = {ms}: can't be negative"));
-            }
-        }
-        let key = format!("animations:{name}:curve");
-        if let Some(curve) = text(parser, &key, warnings) {
-            match curves.get(&curve) {
-                Some(&found) => animation.curve = found,
-                None => warnings.push(format!(
-                    "{key} = {curve}: no such curve, using ease_out (define it with bezier = {curve}, x1, y1, x2, y2)"
-                )),
-            }
+    let pane_in = read_animation(parser, "pane_in", Animation::default(), &curves, warnings);
+    let pane_out = read_animation(parser, "pane_out", Animation::default(), &curves, warnings);
+    Animations {
+        pane_in,
+        pane_out,
+        // Window mode fades like pane mode, except for what's set here.
+        window_in: read_animation(parser, "window_in", pane_in, &curves, warnings),
+        window_out: read_animation(parser, "window_out", pane_out, &curves, warnings),
+    }
+}
+
+/// Reads `animations:<name>:duration` and `:curve`. Fields that aren't set, or are
+/// invalid, keep their value from `base`.
+fn read_animation(
+    parser: &hyprlang::Config,
+    name: &str,
+    base: Animation,
+    curves: &HashMap<String, Curve>,
+    warnings: &mut Vec<String>,
+) -> Animation {
+    let mut animation = base;
+    let key = format!("animations:{name}:duration");
+    if let Some(ms) = number(parser, &key, warnings) {
+        if ms >= 0.0 {
+            animation.duration = Duration::from_secs_f64(ms / 1000.0);
+        } else {
+            warnings.push(format!("{key} = {ms}: can't be negative"));
         }
     }
-    animations
+    let key = format!("animations:{name}:curve");
+    if let Some(curve) = text(parser, &key, warnings) {
+        match curves.get(&curve) {
+            Some(&found) => animation.curve = found,
+            None => warnings.push(format!(
+                "{key} = {curve}: no such curve (define it with bezier = {curve}, x1, y1, x2, y2)"
+            )),
+        }
+    }
+    animation
 }
 
 /// `name, x1, y1, x2, y2`, as in Hyprland's `bezier`.
@@ -678,13 +746,22 @@ fn parse_weight(value: &str) -> Option<u16> {
 }
 
 fn is_known_option(key: &str) -> bool {
-    if PANE_OPTIONS.contains(&key) || ANIMATION_OPTIONS.contains(&key) {
+    if key == "pane:spacing" {
+        return true;
+    }
+    if let Some((section, option)) = key.split_once(':')
+        && HINT_SECTIONS.contains(&section)
+        && STYLE_OPTIONS.contains(&option)
+    {
         return true;
     }
     let mut parts = key.split(':');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("normal"), Some(option), Some(field), None) => {
             SPEED_OPTIONS.contains(&option) && SPEED_FIELDS.contains(&field)
+        }
+        (Some("animations"), Some(name), Some(field), None) => {
+            ANIMATIONS.contains(&name) && ANIMATION_FIELDS.contains(&field)
         }
         _ => false,
     }
@@ -823,8 +900,8 @@ mod tests {
             "pane {\n  spacing = 40\n  chars = asdf\n  font {\n    family = Noto Sans\n    size = 18.5\n    weight = semibold\n  }\n  label {\n    text_color = rgb(ff0000)\n    typed_color = rgba(00ff0080)\n    background = rgba(0, 0, 255, 0.5)\n    padding = 2 6\n    radius = 4\n    border {\n      width = 1.5\n      color = rgba(ffffffff)\n    }\n  }\n  backdrop {\n    color = rgba(00000066)\n  }\n}\n",
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        let pane = config.pane;
-        assert_eq!(pane.spacing, 40.0);
+        assert_eq!(config.pane.spacing, 40.0);
+        let pane = config.pane.style;
         assert_eq!(pane.chars, ['a', 's', 'd', 'f']);
         assert_eq!(
             pane.font,
@@ -847,6 +924,52 @@ mod tests {
             }
         );
         assert_eq!(pane.backdrop, Rgba::hex(0x00000066));
+        // Window mode looks the same without a window section.
+        assert_eq!(config.window.style, pane);
+    }
+
+    #[test]
+    fn window_options_override_only_what_they_set() {
+        let (config, warnings) = parsed(
+            "pane {\n  spacing = 40\n  chars = asdf\n  font {\n    size = 12\n  }\n  label {\n    radius = 6\n  }\n}\nwindow {\n  font {\n    size = 20\n  }\n  label {\n    radius = -3\n  }\n}\n",
+        );
+        assert_eq!(
+            warnings,
+            ["window:label:radius = -3: can't be negative"],
+            "{warnings:?}"
+        );
+        let window = config.window.style;
+        assert_eq!(window.font.size, 20.0);
+        // Everything else, including the invalid radius, comes from pane.
+        assert_eq!(window.chars, ['a', 's', 'd', 'f']);
+        assert_eq!(window.label.radius, 6.0);
+        assert_eq!(config.pane.style.font.size, 12.0);
+    }
+
+    #[test]
+    fn window_options_are_read_without_a_pane_section() {
+        let (config, warnings) = parsed(
+            "window {\n  chars = asdf\n  font {\n    size = 20\n  }\n  label {\n    radius = 6\n  }\n  backdrop {\n    color = rgba(00000080)\n  }\n}\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let window = config.window.style;
+        assert_eq!(window.chars, ['a', 's', 'd', 'f']);
+        assert_eq!(window.font.size, 20.0);
+        assert_eq!(window.label.radius, 6.0);
+        assert_eq!(window.backdrop, Rgba::hex(0x00000080));
+        assert_eq!(config.pane, PaneConfig::default());
+    }
+
+    #[test]
+    fn window_mode_has_no_spacing() {
+        let (_, warnings) = parsed("window {\n  spacing = 40\n  chars = a\n}\n");
+        assert_eq!(
+            warnings,
+            [
+                "window:chars = a: needs at least two characters",
+                "unknown option window:spacing",
+            ]
+        );
     }
 
     #[test]
@@ -899,6 +1022,36 @@ mod tests {
         assert_eq!(animations.pane_in.curve, Curve::new(0.15, 0.0, 0.1, 1.0));
         assert_eq!(animations.pane_out.duration, Duration::from_micros(80_500));
         assert_eq!(animations.pane_out.curve, Curve::LINEAR);
+        // Without their own sections, window mode's fades are pane mode's.
+        assert_eq!(animations.window_in, animations.pane_in);
+        assert_eq!(animations.window_out, animations.pane_out);
+    }
+
+    #[test]
+    fn window_fades_fall_back_to_pane_fades_field_by_field() {
+        let (config, warnings) = parsed(
+            "animations {\n  bezier = quick, 0.15, 0, 0.1, 1\n  pane_in {\n    duration = 150\n    curve = quick\n  }\n  window_in {\n    duration = 100\n  }\n  window_out {\n    curve = linear\n  }\n}\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let animations = config.animations;
+        assert_eq!(animations.window_in.duration, Duration::from_millis(100));
+        assert_eq!(animations.window_in.curve, Curve::new(0.15, 0.0, 0.1, 1.0));
+        assert_eq!(animations.window_out.duration, Duration::ZERO);
+        assert_eq!(animations.window_out.curve, Curve::LINEAR);
+    }
+
+    #[test]
+    fn window_animations_are_read() {
+        let (config, warnings) = parsed(
+            "animations {\n  window_in {\n    duration = 100\n    curve = linear\n  }\n  window_out {\n    duration = 50\n  }\n}\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let animations = config.animations;
+        assert_eq!(animations.window_in.duration, Duration::from_millis(100));
+        assert_eq!(animations.window_in.curve, Curve::LINEAR);
+        assert_eq!(animations.window_out.duration, Duration::from_millis(50));
+        assert_eq!(animations.window_out.curve, Curve::EASE_OUT);
+        assert_eq!(animations.pane_in, Animation::default());
     }
 
     #[test]
@@ -919,7 +1072,7 @@ mod tests {
                 "animations: bezier = back, 1.5, 0, 0.5, 1: x1 and x2 must be between 0 and 1",
                 "animations: bezier = short, 0, 0: expected name, x1, y1, x2, y2",
                 "animations:pane_in:duration = -1: can't be negative",
-                "animations:pane_in:curve = back: no such curve, using ease_out (define it with bezier = back, x1, y1, x2, y2)",
+                "animations:pane_in:curve = back: no such curve (define it with bezier = back, x1, y1, x2, y2)",
             ]
         );
         assert_eq!(config.animations, Animations::default());

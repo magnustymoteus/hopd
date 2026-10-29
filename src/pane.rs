@@ -2,14 +2,7 @@
 //! hands over to normal mode, for clicking and fine-tuning.
 
 use log::{error, info, warn};
-use smithay_client_toolkit::{
-    compositor::Region,
-    seat::keyboard::Keysym,
-    shell::{
-        WaylandSurface,
-        wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
-    },
-};
+use smithay_client_toolkit::{seat::keyboard::Keysym, shell::wlr_layer::LayerSurface};
 use wayland_client::{
     QueueHandle,
     protocol::{wl_shm, wl_surface::WlSurface},
@@ -17,16 +10,13 @@ use wayland_client::{
 
 use crate::State;
 use crate::hints::{Hints, Typed};
-use crate::hyprland::{self, Monitor};
+use crate::hyprland;
 use crate::overlay::Overlay;
 use crate::render::Area;
 
-/// The layer-shell namespace, which Hyprland layer rules can match on.
-pub const LAYER_NAMESPACE: &str = "hyprhopd";
-
 pub struct PaneMode {
     /// The overlay covering the window's monitor.
-    overlay: Overlay,
+    pub overlay: Overlay,
     hints: Hints,
     /// The target window's address, as events write it.
     window: String,
@@ -43,11 +33,11 @@ pub struct PaneMode {
 
 impl State {
     pub fn enter_pane_mode(&mut self, qh: &QueueHandle<State>) {
-        if self.pane.is_some() || self.mode.is_some() {
+        if self.busy() {
             return;
         }
-        // The previous overlay may still be fading out; it goes away now.
-        self.fading_out = None;
+        // Overlays still fading out go away now.
+        self.fading_out.clear();
         let window = match hyprland::active_window() {
             Ok(Some(window)) => window,
             Ok(None) => {
@@ -70,43 +60,14 @@ impl State {
             warn!("the focused window's monitor is missing");
             return;
         };
-        // Wayland names outputs the way Hyprland names monitors, like eDP-1.
-        let Some(output) = self.output_state.outputs().find(|output| {
-            self.output_state
-                .info(output)
-                .and_then(|info| info.name)
-                .is_some_and(|name| name == monitor.name)
-        }) else {
-            warn!("no Wayland output for monitor {}", monitor.name);
+        let Some(layer) = self.overlay_layer(&monitor.name, true, qh) else {
             return;
         };
 
         let [x, y] = window.at.map(f64::from);
         let [width, height] = window.size.map(f64::from);
-        let style = &self.config.pane;
-        let hints = Hints::new(width, height, style.spacing, &style.chars);
-
-        let surface = self.compositor.create_surface(qh);
-        // An empty input region lets the pointer pass through to the window.
-        match Region::new(&self.compositor) {
-            Ok(region) => surface.set_input_region(Some(region.wl_region())),
-            Err(err) => warn!("cannot make the overlay click-through: {err}"),
-        }
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Overlay,
-            Some(LAYER_NAMESPACE),
-            Some(&output),
-        );
-        // Anchored to every edge with size 0: Hyprland sizes it to the whole monitor, and
-        // -1 keeps bars' reserved space from shrinking it.
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_size(0, 0);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        // The first commit carries no buffer; drawing waits for Hyprland's configure.
-        layer.commit();
+        let pane = &self.config.pane;
+        let hints = Hints::grid(width, height, pane.spacing, &pane.style.chars);
 
         // So the backdrop's corners match the window's. Without it they're square.
         let radius = hyprland::window_rounding().unwrap_or_else(|err| {
@@ -134,7 +95,7 @@ impl State {
             window: window.event_address().to_string(),
             area,
             window_at: (x, y),
-            layout: layout_bounds(&monitors),
+            layout: hyprland::layout_bounds(&monitors),
             size: None,
         });
     }
@@ -165,13 +126,15 @@ impl State {
                 return;
             }
         };
+        // Hint positions are relative to the window.
         self.renderer.draw(
             canvas,
             width,
             height,
-            pane.area,
+            &[pane.area],
+            (pane.area.x, pane.area.y),
             &pane.hints,
-            &self.config.pane,
+            &self.config.pane.style,
         );
         if let Err(err) = pane.overlay.show(buffer, (width, height), &self.qh) {
             error!("cannot show the overlay: {err}");
@@ -190,14 +153,12 @@ impl State {
             }
             _ => {}
         }
-        // Only keys that type exactly one character can be part of a label.
-        let mut chars = text.unwrap_or_default().chars();
-        let (Some(c), None) = (chars.next(), chars.next()) else {
+        let Some(c) = single_char(text) else {
             return;
         };
         match pane.hints.push(c) {
             Typed::Narrowed => self.draw_pane(),
-            Typed::Picked { x, y } => self.finish_pane(x, y),
+            Typed::Picked { x, y, .. } => self.finish_pane(x, y),
             Typed::Ignored => {}
         }
     }
@@ -207,34 +168,17 @@ impl State {
         let Some(pane) = self.pane.take() else {
             return;
         };
-        let (left, top, width, height) = pane.layout;
-        let target_x = pane.window_at.0 + x - left;
-        let target_y = pane.window_at.1 + y - top;
         // The labels fade out while the pointer is already where it's going.
-        self.retire(pane.overlay);
-        self.virtual_pointer.motion_absolute(
-            self.timestamp(),
-            target_x.round() as u32,
-            target_y.round() as u32,
-            width.round() as u32,
-            height.round() as u32,
-        );
-        self.virtual_pointer.frame();
+        self.retire(pane.overlay, self.config.animations.pane_out);
+        self.jump_pointer(pane.window_at.0 + x, pane.window_at.1 + y, pane.layout);
         info!("pane mode off, jumped");
         self.enter_normal_mode();
     }
 
     pub fn cancel_pane(&mut self) {
         if let Some(pane) = self.pane.take() {
-            self.retire(pane.overlay);
+            self.retire(pane.overlay, self.config.animations.pane_out);
             info!("pane mode off");
-        }
-    }
-
-    /// Fades an overlay out if pane_out asks for it, otherwise removes it at once.
-    fn retire(&mut self, mut overlay: Overlay) {
-        if overlay.fade_out(self.config.animations.pane_out, &self.qh) {
-            self.fading_out = Some(overlay);
         }
     }
 
@@ -244,36 +188,10 @@ impl State {
             .is_some_and(|pane| pane.overlay.surface() == surface)
     }
 
-    /// A frame callback for one of hyprhopd's overlays: time for the next fade step.
-    pub fn overlay_frame(&mut self, surface: &WlSurface) {
-        if let Some(pane) = self.pane.as_mut()
-            && pane.overlay.surface() == surface
-        {
-            pane.overlay.frame(&self.qh);
-        } else if let Some(overlay) = self.fading_out.as_mut()
-            && overlay.surface() == surface
-            && !overlay.frame(&self.qh)
-        {
-            self.fading_out = None;
-        }
-    }
-
-    /// Hyprland removed an overlay, for example because its monitor went away.
-    pub fn overlay_closed(&mut self, layer: &LayerSurface) {
-        if self
-            .pane
+    pub fn owns_pane_layer(&self, layer: &LayerSurface) -> bool {
+        self.pane
             .as_ref()
             .is_some_and(|pane| &pane.overlay.layer == layer)
-        {
-            self.pane = None;
-            info!("pane mode off");
-        } else if self
-            .fading_out
-            .as_ref()
-            .is_some_and(|overlay| &overlay.layer == layer)
-        {
-            self.fading_out = None;
-        }
     }
 
     /// Cancels pane mode when its window closes, moves or changes shape, since the
@@ -296,50 +214,11 @@ impl State {
     }
 }
 
-/// Top-left corner and size of the box around every monitor, in layout coordinates.
-fn layout_bounds(monitors: &[Monitor]) -> (f64, f64, f64, f64) {
-    let boxes = monitors.iter().map(|monitor| {
-        let (width, height) = monitor.logical_size();
-        let (x, y) = (f64::from(monitor.x), f64::from(monitor.y));
-        (x, y, x + width, y + height)
-    });
-    let (left, top, right, bottom) = boxes.fold(
-        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
-        |(l, t, r, b), (x0, y0, x1, y1)| (l.min(x0), t.min(y0), r.max(x1), b.max(y1)),
-    );
-    (left, top, right - left, bottom - top)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn monitor(x: i32, y: i32, width: i32, height: i32, scale: f64, transform: i32) -> Monitor {
-        Monitor {
-            id: 0,
-            name: String::new(),
-            x,
-            y,
-            width,
-            height,
-            scale,
-            transform,
-        }
-    }
-
-    #[test]
-    fn layout_covers_every_monitor_in_logical_pixels() {
-        let monitors = [
-            monitor(0, 0, 1920, 1080, 1.0, 0),
-            // A 4K monitor at scale 2, to the right: 1920x1080 logical.
-            monitor(1920, -200, 3840, 2160, 2.0, 0),
-        ];
-        assert_eq!(layout_bounds(&monitors), (0.0, -200.0, 3840.0, 1280.0));
-    }
-
-    #[test]
-    fn rotated_monitors_swap_width_and_height() {
-        let monitors = [monitor(0, 0, 1920, 1080, 1.0, 1)];
-        assert_eq!(layout_bounds(&monitors), (0.0, 0.0, 1080.0, 1920.0));
+/// The character a key typed, if it typed exactly one: only those can be part of a label.
+pub fn single_char(text: Option<&str>) -> Option<char> {
+    let mut chars = text.unwrap_or_default().chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }

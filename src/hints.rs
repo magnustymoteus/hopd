@@ -1,10 +1,11 @@
-//! Pane mode's hints: an even grid of points over a window, each with a label to type.
-//! Wayland doesn't let clients see inside other windows, so there are no buttons to label.
+//! Hints: points on screen, each with a label to type. Pane mode puts an even grid of them
+//! over a window (Wayland doesn't let clients see inside other windows, so there are no
+//! buttons to label); window mode puts one at the centre of each window.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hint {
     pub label: Vec<char>,
-    /// Position relative to the window's top-left corner, in pixels.
+    /// Position in pixels, in whatever coordinates the points were given in.
     pub x: f64,
     pub y: f64,
 }
@@ -14,8 +15,9 @@ pub struct Hint {
 pub enum Typed {
     /// Fewer labels match now.
     Narrowed,
-    /// The character completed this hint's label.
-    Picked { x: f64, y: f64 },
+    /// The character completed the label of the hint at `index`, counting in the order
+    /// the points were given.
+    Picked { index: usize, x: f64, y: f64 },
     /// No label continues with it, so it was dropped.
     Ignored,
 }
@@ -26,15 +28,18 @@ pub struct Hints {
 }
 
 impl Hints {
-    /// Hints `spacing` pixels apart, centred in a `width` × `height` window. Labels all
-    /// have the same length, the shortest that gives every point its own label, so no
-    /// label is the start of another.
-    pub fn new(width: f64, height: f64, spacing: f64, chars: &[char]) -> Hints {
+    /// Hints `spacing` pixels apart, centred in a `width` × `height` window, row by row.
+    pub fn grid(width: f64, height: f64, spacing: f64, chars: &[char]) -> Hints {
         let xs = axis(width, spacing);
         let ys = axis(height, spacing);
-        let count = xs.len() * ys.len();
         let points = ys.iter().flat_map(|&y| xs.iter().map(move |&x| (x, y)));
-        let hints = labels(count, chars)
+        Hints::at(points.collect(), chars)
+    }
+
+    /// A hint at each point, labelled in order. Labels all have the same length, the
+    /// shortest that gives every point its own label, so no label is the start of another.
+    pub fn at(points: Vec<(f64, f64)>, chars: &[char]) -> Hints {
+        let hints = labels(points.len(), chars)
             .zip(points)
             .map(|(label, (x, y))| Hint { label, x, y })
             .collect();
@@ -59,15 +64,19 @@ impl Hints {
         self.typed.push(c);
         // Copied out, so the borrow of `self` ends before `typed` may change again.
         let first = self
-            .visible()
-            .next()
-            .map(|hint| (hint.label.len(), hint.x, hint.y));
+            .hints
+            .iter()
+            .enumerate()
+            .find(|(_, hint)| hint.label.starts_with(&self.typed))
+            .map(|(index, hint)| (index, hint.label.len(), hint.x, hint.y));
         match first {
             None => {
                 self.typed.pop();
                 Typed::Ignored
             }
-            Some((length, x, y)) if length == self.typed.len() => Typed::Picked { x, y },
+            Some((index, length, x, y)) if length == self.typed.len() => {
+                Typed::Picked { index, x, y }
+            }
             Some(_) => Typed::Narrowed,
         }
     }
@@ -129,7 +138,7 @@ mod tests {
 
     #[test]
     fn hints_cover_the_window_row_by_row() {
-        let hints = Hints::new(120.0, 120.0, 60.0, &['a', 'b', 'c', 'd']);
+        let hints = Hints::grid(120.0, 120.0, 60.0, &['a', 'b', 'c', 'd']);
         let all: Vec<(String, f64, f64)> = hints
             .visible()
             .map(|h| (text(&h.label), h.x, h.y))
@@ -148,16 +157,48 @@ mod tests {
     #[test]
     fn typing_narrows_then_picks() {
         // 5 points with 2 chars: labels aaa, aab, aba, abb, baa.
-        let mut hints = Hints::new(300.0, 60.0, 60.0, &['a', 'b']);
+        let mut hints = Hints::grid(300.0, 60.0, 60.0, &['a', 'b']);
         assert_eq!(hints.push('a'), Typed::Narrowed);
         assert_eq!(hints.visible().count(), 4);
         assert_eq!(hints.push('b'), Typed::Narrowed);
-        assert_eq!(hints.push('a'), Typed::Picked { x: 150.0, y: 30.0 });
+        assert_eq!(
+            hints.push('a'),
+            Typed::Picked {
+                index: 2,
+                x: 150.0,
+                y: 30.0
+            }
+        );
+    }
+
+    #[test]
+    fn hints_can_go_at_any_points() {
+        let mut hints = Hints::at(vec![(500.0, 20.0), (-30.0, 7.5)], &['a', 'b', 'c']);
+        let all: Vec<(String, f64, f64)> = hints
+            .visible()
+            .map(|h| (text(&h.label), h.x, h.y))
+            .collect();
+        assert_eq!(all, [("a".into(), 500.0, 20.0), ("b".into(), -30.0, 7.5)]);
+        assert_eq!(
+            hints.push('b'),
+            Typed::Picked {
+                index: 1,
+                x: -30.0,
+                y: 7.5
+            }
+        );
+    }
+
+    #[test]
+    fn no_points_means_nothing_to_type() {
+        let mut hints = Hints::at(Vec::new(), &['a', 'b']);
+        assert_eq!(hints.visible().count(), 0);
+        assert_eq!(hints.push('a'), Typed::Ignored);
     }
 
     #[test]
     fn characters_no_label_continues_with_are_ignored() {
-        let mut hints = Hints::new(300.0, 60.0, 60.0, &['a', 'b']);
+        let mut hints = Hints::grid(300.0, 60.0, 60.0, &['a', 'b']);
         assert_eq!(hints.push('b'), Typed::Narrowed);
         assert_eq!(hints.push('b'), Typed::Ignored);
         assert_eq!(hints.push('z'), Typed::Ignored);
@@ -166,7 +207,7 @@ mod tests {
 
     #[test]
     fn backspace_widens_again() {
-        let mut hints = Hints::new(300.0, 60.0, 60.0, &['a', 'b']);
+        let mut hints = Hints::grid(300.0, 60.0, 60.0, &['a', 'b']);
         hints.push('a');
         hints.push('b');
         hints.pop();

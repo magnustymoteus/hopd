@@ -1,5 +1,5 @@
 //! Event handlers hyprhopd has to provide for sctk and for the Hyprland and wlr protocols.
-//! Most are empty: hyprhopd reacts to shortcuts, and in pane mode to its overlay's
+//! Most are empty: hyprhopd reacts to shortcuts, and in pane and window mode to its overlays'
 //! configure events and keys.
 
 use log::error;
@@ -131,7 +131,7 @@ impl Dispatch2<WpAlphaModifierSurfaceV1, State> for AlphaModifierData {
     }
 }
 
-// --- Pane mode's overlay ---
+// --- Pane and window mode's overlays ---
 
 impl LayerShellHandler for State {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
@@ -142,11 +142,11 @@ impl LayerShellHandler for State {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        self.pane_configured(configure.new_size);
+        self.overlay_configured(layer, configure.new_size);
     }
 }
 
@@ -174,6 +174,8 @@ impl KeyboardHandler for State {
         // Something else took the keyboard (a lock screen, say): typing can't continue.
         if self.owns_pane_surface(surface) {
             self.cancel_pane();
+        } else if self.owns_window_surface(surface) {
+            self.cancel_window();
         }
     }
 
@@ -185,7 +187,11 @@ impl KeyboardHandler for State {
         _: u32,
         event: KeyEvent,
     ) {
-        self.pane_key(event.keysym, event.utf8.as_deref());
+        if self.window.is_some() {
+            self.window_key(event.keysym, event.utf8.as_deref());
+        } else {
+            self.pane_key(event.keysym, event.utf8.as_deref());
+        }
     }
 
     // Labels are typed one press at a time; a held key shouldn't type it again.
