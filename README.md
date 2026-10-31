@@ -32,12 +32,13 @@ Control the pointer from the keyboard on [Hyprland](https://hypr.land), in the s
 
 [Releases](https://github.com/magnustymoteus/hyprhopd/releases) have archives for
 x86_64 and aarch64 (glibc 2.35 or newer). Each one holds the `hyprhopd` binary, this
-README, the license and the example config. To check and install one:
+README, the license and the example config. To check and install the one you downloaded
+(the `*` stands for its version):
 
 ```sh
-sha256sum -c hyprhopd-v0.1.0-x86_64-linux.tar.gz.sha256
-tar -xzf hyprhopd-v0.1.0-x86_64-linux.tar.gz
-install -Dm755 hyprhopd-v0.1.0-x86_64-linux/hyprhopd ~/.local/bin/hyprhopd
+sha256sum -c hyprhopd-v*-x86_64-linux.tar.gz.sha256
+tar -xzf hyprhopd-v*-x86_64-linux.tar.gz
+install -Dm755 hyprhopd-v*-x86_64-linux/hyprhopd ~/.local/bin/hyprhopd
 ```
 
 Make sure `~/.local/bin` is on the `PATH` Hyprland starts programs with.
