@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// The directory holding this Hyprland instance's sockets.
-fn socket_dir() -> io::Result<PathBuf> {
+pub fn socket_dir() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR");
     let instance = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
     match (runtime, instance) {

@@ -3,6 +3,7 @@ mod easing;
 mod handlers;
 mod hints;
 mod hyprland;
+mod instance;
 mod logging;
 mod motion;
 mod overlay;
@@ -239,6 +240,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before registering the shortcuts, so two copies never both react to them.
+    let _instance = instance::claim()?;
     let conn = Connection::connect_to_env()
         .map_err(|e| format!("cannot connect to a Wayland compositor: {e}"))?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn)?;

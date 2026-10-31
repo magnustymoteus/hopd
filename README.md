@@ -69,7 +69,8 @@ Any key combination works. hyprhopd registers `hyprhopd:normal`, `hyprhopd:pane`
 `hyprhopd:window` as global shortcuts, and `hyprctl globalshortcuts` lists them once it's
 running.
 
-Run only one hyprhopd at a time: every running copy reacts to the shortcuts.
+Only one hyprhopd runs per Hyprland session: starting it again replaces the running copy,
+so after updating, running `hyprhopd` once more switches to the new version.
 
 ## Usage
 

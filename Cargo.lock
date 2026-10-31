@@ -300,6 +300,7 @@ dependencies = [
  "cosmic-text",
  "hyprlang",
  "inotify",
+ "libc",
  "log",
  "serde",
  "serde_json",
